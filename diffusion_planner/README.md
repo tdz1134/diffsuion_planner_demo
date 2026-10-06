@@ -10,6 +10,39 @@ Latent-Diffusion 里的编解码组件。
 
 ---
 
+## 0. 新克隆后如何跑起来(clone 快速上手)
+
+> 本仓库**不含**虚拟环境 `venv_py38/` 和数据集 `dataset_*.npz`(见 `.gitignore`),
+> 但**含训练好的权重** `vae_map.pt`、`planner_ckpt.pt` 与 `figs/` 效果图。
+> 缺数据集时脚本会**自动调用 `make_dataset.py` 生成**,无需手动预处理。
+
+**① 建环境(一次性)** —— Python 3.8 + CUDA 版 PyTorch(RTX 4060 用 cu121):
+```bash
+conda create -y -n dp python=3.8 && conda activate dp
+pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+pip install numpy matplotlib opencv-python tqdm
+cd diffusion_planner
+```
+
+**② 只想快速看效果**(自动造 1500 条小数据,几十秒~2 分钟,直接用仓库自带的 `vae_map.pt` 作条件):
+```bash
+python diffusion_path.py --quick
+#   产物: figs/diffusion_path/fig_planner.png
+```
+
+**③ 完整复现**(先生成 2 万条数据,再训练 VAE 与规划器):
+```bash
+python make_dataset.py --data 20000                             # 一次性, 约 24 分钟
+python vae_map.py                                               # 地图 VAE, 约 1 分钟 → vae_map.pt
+python diffusion_path.py --data 20000 --train 20000 --batch 512 --cond lat
+#   --cond lat: 加载冻结 vae_map.pt 的 latent + SDF 双分支做地图条件(默认)
+#   --cond cnn: 不依赖 VAE 的原始 CNN 基线(便于 A/B 对比)
+```
+> 无 CUDA / Windows 也能跑,只是慢;把上面的 torch 换成 CPU 版即可。
+> 各脚本详细参数见下方 §2~§5。
+
+---
+
 ## 1. 目录结构
 
 ```
