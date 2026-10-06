@@ -8,6 +8,10 @@ Latent-Diffusion 里的编解码组件。
 - 运行环境:Python 3.8 + PyTorch 2.4.1+cu121,本仓库用 `venv_py38`(与代码同级、已 gitignore),GPU = **RTX 4060 Laptop 8GB**
 - 训练一次完整模型:数据集生成约 24 分钟(一次性、可复用)+ 地图 VAE 约 5 分钟 + 规划器训练约 1~2 分钟(AMP+大batch 提速后)
 
+> **本仓库另含一个泊车规划器**(独立包 `parking/`:混合 A\* 造数据 → 地图 VAE →
+> SE(2) 轨迹扩散 → 修复/评估)。**不动本 demo**,只复用其中的地图 VAE 类。
+> 用法与结果见 **§7**,通俗搭建记录见仓库根 **`PARKING_NOTES.md`**。
+
 ---
 
 ## 0. 新克隆后如何跑起来(clone 快速上手)
@@ -219,8 +223,10 @@ venv_py38/bin/python -m parking.evaluate --npz cache/parking_4000.npz # ④ 评�
   采样后**修复**(`repair.py`:SDF 外推 + 拉普拉斯平滑 + 钉端点)把无碰撞率抬到 ~20~30%,但可行性仍低。
 - **加数据(4k→12k)+ 加步数(12k→30k)重训并没有救回可行性** → 瓶颈不在数据量,而在
   **ε-MSE 目标 + MLP 去噪器**对"尖锐、多模态"泊车轨迹的 averaging。
-- **改进方向(Phase 2,待做)**:曲率/避障进训练损失、采样时 SDF/C 空间引导、按足迹做 C 空间膨胀的更强修复、
-  去噪器升级 MLP→1D-Conv/小 Transformer。详见 `PARKING_NOTES.md` §5。
+- **Phase 2 已试(诚实,均未突破端到端可行)**:
+  - *训练内惩罚*(把曲率/航向/足迹碰撞的可微代价加进 ε-MSE,`penalty.py`):**两组权重都让 DDPM 采样器发散**(长度比 600~870 的螺旋、碰撞率反而 0%)——轨迹代价会系统性偏置学出的 score。已回滚权重。
+  - *采样引导*(`evaluate --g-*`,晚步 `min_abar`高、仅碰撞):**安全的 Pareto 改善**——原始无碰撞率 **1.7%→25%**、修复后 →~32%,最大曲率 4.8→3.5,长度比稳定不发散;但**运动学可行性仍 0%**(曲率离上限差 ~15×),端到端成功率仍 0。加曲率/航向项到引导会立刻发散(同上 ill-conditioning)。对比图 `figs/parking/m8_guided_compare.png`。
+- **真正的后续**:瓶颈是**运动学可行性(正确的倒车几何)**而非避障;需去噪器升级 MLP→1D-Conv/小 Transformer + **在 score 空间做正确的 classifier guidance**,而非把几何代价硬塞进 ε-MSE 或 x0 梯度。详见 `PARKING_NOTES.md` §5/M8。
 
 ---
 

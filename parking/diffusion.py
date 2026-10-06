@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .penalty import heading_consistency, curvature_pen, footprint_collision
+
 
 def make_schedule(t_steps, b0, b1, device):
     betas = torch.linspace(b0, b1, t_steps, device=device)
@@ -25,6 +27,13 @@ def q_sample(x0, t, sch, noise=None):
     sa = torch.sqrt(sch["abar"][t])[:, None, None]
     sb = torch.sqrt(1.0 - sch["abar"][t])[:, None, None]
     return sa * x0 + sb * noise, noise
+
+
+def pred_x0(xt, eps, sch, t):
+    """由 x_t 与预测噪声 eps 反推 x0_hat = (x_t - sqrt(1-abar)*eps)/sqrt(abar)。"""
+    sa = torch.sqrt(sch["abar"][t])[:, None, None]
+    sb = torch.sqrt(1.0 - sch["abar"][t])[:, None, None]
+    return (xt - sb * eps) / sa
 
 
 def time_embedding(t, dim, device):
@@ -57,21 +66,40 @@ class CondDenoiser(nn.Module):
         return self.net(h).reshape(x.shape[0], self.n_wp, self.dim)
 
 
-@torch.no_grad()
-def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True):
-    """反向去噪采样。每步钉住首尾位姿(含朝向)。返回 (B,N,4) 归一化轨迹。"""
+def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None):
+    """反向去噪采样。每步钉住首尾位姿(含朝向)。返回 (B,N,4) 归一化轨迹。
+
+    guide=None 为纯 DDPM。否则每步在**预测 x0_hat** 上算轨迹代价(曲率/足迹碰撞/航向)的梯度,
+    后推至后验均值 mean -= scale * dCost/dx —— 不改变训练与已学 score(sampler-safe 推理引导)。
+    guide 需包含: veh, bbox, foot(P,2 tensor), sdf_clip, w_nh/w_curv/w_coll, scale, margin, min_abar。
+    """
     B = maps.shape[0]
     model.eval(); enc.eval()
-    map_emb = enc(maps, z=z) if z is not None else enc(maps)
+    with torch.no_grad():
+        map_emb = enc(maps, z=z) if z is not None else enc(maps)
     T = sch["T"]
     x = torch.randn(B, model.n_wp, model.dim, device=maps.device)
     if pin:
         x[:, 0] = starts4; x[:, -1] = goals4
+    if guide is not None:
+        sdf_m = maps[:, 1:2] * guide["sdf_clip"]
+        inv_rmin = 1.0 / guide["veh"].r_min
+        min_abar = guide.get("min_abar", 0.1)
     for t in reversed(range(T)):
         tt = torch.full((B,), t, device=maps.device, dtype=torch.long)
-        eps = model(x, tt, map_emb, starts4, goals4)
-        mean = (x - sch["betas"][t] / torch.sqrt(1.0 - sch["abar"][t]) * eps) \
-            / torch.sqrt(sch["alphas"][t])
+        with torch.no_grad():
+            eps = model(x, tt, map_emb, starts4, goals4)
+            mean = (x - sch["betas"][t] / torch.sqrt(1.0 - sch["abar"][t]) * eps) \
+                / torch.sqrt(sch["alphas"][t])
+        if guide is not None and float(sch["abar"][t]) >= min_abar:
+            xg = x.detach().requires_grad_(True)
+            x0h = pred_x0(xg, eps, sch, tt)
+            cost = (guide["w_nh"] * heading_consistency(x0h, guide["bbox"])
+                    + guide["w_curv"] * curvature_pen(x0h, guide["bbox"], inv_rmin)
+                    + guide["w_coll"] * footprint_collision(
+                        x0h, sdf_m, guide["bbox"], guide["foot"], guide["margin"]))
+            g = torch.autograd.grad(cost.sum(), xg)[0]
+            mean = mean - guide["scale"] * g
         if t > 0:
             x = mean + torch.sqrt(sch["betas"][t]) * torch.randn_like(x)
         else:

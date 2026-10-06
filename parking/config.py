@@ -127,6 +127,11 @@ class DiffusionConfig:
     train_steps: int = 20000
     amp: bool = True
     cond: str = "lat"            # lat=冻结VAE latent+SDF; cnn=纯CNN基线
+    # Phase 2: 轨迹空间辅助惩罚(作用于去噪得到的 x0_hat; 权重 0=关闭, 向后兼容)
+    w_nh: float = 0.0            # 航向一致性(非完整约束, 允许前进/倒车, 惩罚侧滑)
+    w_curv: float = 0.0          # 曲率超限 |kappa|>1/r_min 惩罚
+    w_coll: float = 0.0          # 足迹角点 SDF 碰撞惩罚
+    coll_margin: float = 0.15    # 足迹角点距障碍的最小间隙(m)
     # VAE
     lat_ch: int = 8
     ch: Tuple[int, int, int, int] = (16, 32, 48, 64)

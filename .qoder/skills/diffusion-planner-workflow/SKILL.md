@@ -1,13 +1,18 @@
 ---
 name: diffusion-planner-workflow
-description: Run and modify the occupancy-grid diffusion path planner and map VAE in this repo. Covers the migrated venv (../venv_py38, invoked by absolute path, GPU RTX 4060), the make_dataset -> diffusion_path -> vae_map pipeline, tqdm progress bars for long jobs, dataset_<M>.npz caching, figs/ output layout, and the --quick smoke test. Use when building/regenerating data, training the planner or VAE, running or debugging these scripts, or when the user mentions diffusion_path, vae_map, make_dataset, grid_env, or the venv.
+description: Run and modify the two conditional-DDPM planners in this repo - the occupancy-grid path planner and map VAE in diffusion_planner/, and the parking planner in parking/ (Hybrid A* teacher -> dataset -> map VAE -> SE(2) trajectory diffusion -> repair/evaluate). Covers the migrated venv (venv_py38, invoked by absolute path, GPU RTX 4060, numba 0.58.1), the make_dataset -> diffusion_path -> vae_map and dataset -> map_vae -> train -> evaluate pipelines, tqdm progress bars, npz caching, figs/ layout, numba JIT warm-up, and --quick smoke tests. Use when building/regenerating data, training the planner/VAE/diffusion, running or debugging these scripts, or when the user mentions diffusion_path, vae_map, make_dataset, grid_env, parking, hybrid_a_star, HA*, scenarios, repair, evaluate, or the venv.
 ---
 
 # Diffusion Planner — Run & Modify Workflow
 
-Guidance for the training pipeline in `diffusion_planner/` (conditional DDPM path
-planner + occupancy-map VAE). Long steps are meant to be **run by the user** with
-tqdm progress bars; the agent should wire scripts, keep bars, and avoid blocking.
+Guidance for the two conditional-DDPM planners in this repo:
+- **`diffusion_planner/`** - occupancy-grid path planner + map VAE (the demo, sections below).
+- **`parking/`** - parking planner (Hybrid A* teacher -> dataset -> map VAE -> SE(2)
+  trajectory diffusion -> repair/evaluate). See the "Parking planner" section; the full
+  narrative lives in `PARKING_NOTES.md`.
+
+Long steps are meant to be **run by the user** with tqdm progress bars; the agent
+should wire scripts, keep bars, and avoid blocking.
 
 ## Environment (important)
 
@@ -22,6 +27,9 @@ tqdm progress bars; the agent should wire scripts, keep bars, and avoid blocking
 - torch 2.4.1+cu121, CUDA available on RTX 4060. Scripts auto-pick `cuda` if present
   and print `[info] device = cuda`.
 - tqdm is installed (4.70.x). Long loops MUST keep a tqdm bar.
+- `parking/` additionally needs **numba 0.58.1** (installed in the venv) for the Hybrid A*
+  hot loop; without it the search falls back to slow pure-Python (~240x slower, unusable
+  for dataset generation).
 
 ## Pipeline & files
 
@@ -71,6 +79,50 @@ cd diffusion_planner
 Regenerate cache: `make_dataset.py --data M --overwrite`, or
 `diffusion_path.py --regen`.
 
+## Parking planner (`parking/`)
+
+Independent package (does **not** modify `diffusion_planner/`; only reuses `vae_map.VAE`
+via `sys.path`). Every swappable piece is behind an ABC + dataclass (`interfaces.py` /
+`config.py`): motion planner, scenario generator, post-processor, map conditioner,
+generative planner.
+
+Run everything from the **repo root** with `-m` (NOT from inside `parking/`). Pipeline
+order is **dataset -> map_vae -> train -> evaluate**:
+
+```bash
+cd /home/t/projects/diffusion_planner_demo
+venv_py38/bin/python -m parking.dataset  --n 4000 --proc 8              # HA* teacher -> cache/parking_<M>.npz
+venv_py38/bin/python -m parking.map_vae  --npz cache/parking_4000.npz   # retrain+freeze map VAE -> parking/cache/vae_parking.pt
+venv_py38/bin/python -m parking.train    --npz cache/parking_4000.npz --steps 12000   # -> parking/cache/diffusion_parking.pt
+venv_py38/bin/python -m parking.evaluate --npz cache/parking_4000.npz   # metrics + figs/parking/m6_eval_compare.png
+venv_py38/bin/python -m parking.<mod>                                 # each module also has a __main__ self-test
+```
+
+| Module | Role |
+|--------|------|
+| `hybrid_a_star.py` | **teacher**: Hybrid A*, whole search in one `@njit` (array states + hand-written heap + inlined footprint collision). ~0.078 s/pose |
+| `scenarios.py` | random perpendicular (reverse-in) + parallel slots with neighbor cars |
+| `postprocess.py` | resample dense HA* path -> **exactly N=40** `(x,y,cos,sin)`, endpoints pinned |
+| `dataset.py` | multiprocessing build + npz cache + success-rate stats |
+| `map_vae.py` | reuse `diffusion_planner/vae_map.py` VAE on parking occupancy -> freeze |
+| `conditioner.py` / `diffusion.py` / `train.py` | frozen-VAE latent (+) SDF condition; DDPM over (N,4); AMP + big-batch + precomputed latent; pins endpoints each step |
+| `repair.py` / `evaluate.py` | SDF-push + Laplacian-smooth; footprint-collision / curvature / length-ratio metrics (raw vs repaired) |
+
+**npz layout** (`cache/parking_<M>.npz`; `*.npz` is gitignored): `maps` uint8
+`(M,2,72,128)` = `[occupancy(0/1), SDF x 255]`; `traj` `(M,40,4)` = **world coords**
+`[x,y,cos,sin]`; `start_pose`/`goal_pose` `(M,3)` = `[x,y,theta]`; `gear (M,40) int8`;
+`scene_type uint8` (0=perp, 1=par); `length`, `n_switches`, `split` (0=train, 1=eval),
+`bbox (4,)`. Normalization is **global via `bbox`**, so `evaluate` MUST use the same npz
+the ckpt was trained on.
+
+Rules specific to `parking/`:
+- **numba warm-up**: the first `plan()` compiles the JIT (~1.4 s) then caches
+  (`cache=True`). `dataset.py` deliberately runs one search in the **main process before**
+  spawning the Pool, so workers reuse the cache instead of each recompiling.
+- Maps are **72x128** (both multiples of 8) so the reused VAE's 3 stride-2 downsamples work.
+- Heading uses `(cos,sin)` (no wrap issues); `gear` is metadata only (not diffused).
+- Plots use English labels (same no-CJK-font constraint as the demo).
+
 ## Working rules for the agent
 
 1. **Do not block on long training.** Write/adjust the code, then hand the user the
@@ -92,7 +144,23 @@ Regenerate cache: `make_dataset.py --data M --overwrite`, or
   shortcuts through obstacles. Planned fixes (not yet done): C-space obstacle
   inflation, per-waypoint local-SDF conditioning, obstacle-avoidance loss /
   sampling guidance, stronger `repair_path`.
-- VAE was upgraded from a 32-d global vector to a **spatial latent (8×8×8) +
-  residual blocks + weighted BCE (pos_weight=3) + low KL (beta=1e-2)**, ~5M params.
-  U-Net skip connections were deliberately **not** used to avoid latent collapse
-  (keeps the latent usable for a future latent-diffusion).
+- VAE was upgraded from a 32-d global vector to a **spatial latent (8x8x8) +
+  residual blocks + weighted BCE (pos_weight=3) + low KL (beta=1e-2)** - now
+  **~444K params** (down from ~5M). U-Net skip connections were deliberately **not**
+  used to avoid latent collapse (keeps the latent usable for a future latent-diffusion).
+
+## Parking planner - known state
+
+- **HA* teacher works well**: ~0.078 s/pose, 100% feasible/collision-free (it is the
+  data source). Dataset solve rate 0.76-0.80 (failures discarded + resampled).
+- **Map VAE on parking maps**: pixel acc 99.80%, obstacle IoU 99.13% (frozen).
+- **Diffusion Phase 1 (epsilon-MSE + MLP) is NOT yet kinodynamically feasible**: raw
+  footprint-collision-free ~1.7%, feasibility 0%, curvature far above the 1/r_min cap.
+  `repair.py` lifts collision-free to ~20-30% but cannot fix feasibility; retraining on
+  12k data / 30k steps did **not** recover it -> bottleneck is objective / architecture
+  (averaging over sharp, multimodal maneuvers), not data volume.
+- **Phase 2 (attempted, mostly negative; see PARKING_NOTES M8)**:
+  - *In-training penalty* (`penalty.py`, wired into `train.py` via `--w-nh/--w-curv/--w-coll`, gated by `sqrt(abar)`, default 0): **both weight groups diverge the DDPM sampler** (spirals, length ratio 600-870x, collision 0%) - trajectory geometry cost is structurally incompatible with the epsilon-MSE objective. Checkpoint rolled back.
+  - *Sampling guidance* (`evaluate --g-scale/--g-coll/--g-curv/--g-min-abar`, late-step only, coll-only): **a real, safe Pareto win** - raw collision-free 1.7%->25% (repair ~32%), max-kappa drops, length ratio stays stable/no divergence. But adding curvature/heading terms diverges instantly, and it does NOT reach kinematic feasibility -> end-to-end success still 0%.
+  - **The blocker is feasibility (reversing geometry), not collision.** Real next steps: MLP -> 1D-Conv/Transformer denoiser; proper classifier-guidance in score/eps space (train a feasibility discriminator), not geometry cost stuffed into epsilon-MSE or x0 gradients.
+- Authoritative docs: `PARKING_NOTES.md` (milestone log) and `diffusion_planner/README.md` section 7.

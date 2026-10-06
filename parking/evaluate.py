@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from .config import default_config
-from .dataset import load_dataset
+from .dataset import load_dataset, SDF_CLIP
 from .geometry import (denormalize_xy, cs_to_heading, cum_arclen,
                        curvature_from_poses, path_length, wrap, pose_error)
 from .vehicle import Vehicle
@@ -91,7 +91,7 @@ def load_model(ckpt=CKPT, cfg=None):
     return model, enc, blob.get("bbox", (0, 0, cfg.lot.world_w, cfg.lot.world_h)), cond
 
 
-def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None):
+def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw=None):
     cfg = default_config()
     dc = cfg.diffusion
     veh = Vehicle(cfg.vehicle)
@@ -123,7 +123,15 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None):
     if cond == "lat":
         from .train import precompute_latents
         lat = precompute_latents(enc.vae, maps_t)
-    gen_n = sample(model, enc, maps_t, s4, g4, sch, z=lat).cpu().numpy()   # (k,N,4) norm
+    guide = None
+    if gkw and gkw.get("scale", 0) > 0:
+        foot = torch.tensor(Vehicle(cfg.vehicle).footprint_local,
+                            dtype=torch.float32, device=device)
+        guide = dict(foot=foot, veh=cfg.vehicle, bbox=bbox, sdf_clip=SDF_CLIP,
+                     w_nh=gkw.get("nh", 0.0), w_curv=gkw.get("curv", 0.0),
+                     w_coll=gkw.get("coll", 0.0), scale=gkw["scale"],
+                     margin=gkw.get("margin", 0.15), min_abar=gkw.get("min_abar", 0.1))
+    gen_n = sample(model, enc, maps_t, s4, g4, sch, z=lat, guide=guide).cpu().numpy()   # (k,N,4) norm
 
     res = cfg.lot.res
     n_col = n_feas = n_ok = 0
@@ -160,6 +168,7 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None):
 
     metrics = dict(
         k=k, cond=cond,
+        guided=float(gkw.get("scale", 0.0)) if gkw else 0.0,
         raw_collision_free=n_col / k, raw_feasible=n_feas / k, raw_success=n_ok / k,
         raw_len_ratio=float(np.mean(ratios)), raw_max_kappa=float(np.mean(maxks)),
         rep_collision_free=r_col / k, rep_feasible=r_feas / k, rep_success=r_ok / k,
@@ -211,10 +220,18 @@ if __name__ == "__main__":
     ap.add_argument("--k", type=int, default=None)
     ap.add_argument("--viz", type=int, default=None)
     ap.add_argument("--out", type=str, default=None)
+    ap.add_argument("--g-scale", type=float, default=0.0, help="推理引导总步长(0=关)")
+    ap.add_argument("--g-curv", type=float, default=1.0, help="引导中曲率代价权重")
+    ap.add_argument("--g-coll", type=float, default=1.0, help="引导中足迹碰撞代价权重")
+    ap.add_argument("--g-nh", type=float, default=0.0, help="引导中航向一致性代价权重")
+    ap.add_argument("--g-margin", type=float, default=0.15, help="引导碰撞安全间隙(m)")
+    ap.add_argument("--g-min-abar", type=float, default=0.1, help="仅在 abar>=此值(低噪)时引导")
     a = ap.parse_args()
     out = a.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "figs", "parking", "m6_eval_compare.png")
-    m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out)
+    gkw = dict(scale=a.g_scale, curv=a.g_curv, coll=a.g_coll, nh=a.g_nh,
+               margin=a.g_margin, min_abar=a.g_min_abar)
+    m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out, gkw=gkw)
     for kk, v in m.items():
         print("  %-22s %s" % (kk, round(v, 4) if isinstance(v, float) else v))
     print("[saved] %s" % out)

@@ -17,11 +17,13 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from .config import default_config
-from .dataset import load_dataset
+from .dataset import load_dataset, SDF_CLIP
 from .geometry import normalize_xy, heading_to_cs
 from .map_vae import load_frozen_vae
 from .conditioner import MapConditioner, MapEncoderCNN
-from .diffusion import make_schedule, q_sample, CondDenoiser, sample
+from .diffusion import make_schedule, q_sample, CondDenoiser, sample, pred_x0
+from .penalty import traj_penalty_terms
+from .vehicle import Vehicle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _PKG = os.path.dirname(os.path.abspath(__file__))
@@ -56,7 +58,7 @@ def precompute_latents(vae, maps, batch=2048):
 # --------------------------------------------------------------------------- #
 # 训练
 # --------------------------------------------------------------------------- #
-def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None):
+def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=None):
     params = [p for p in list(model.parameters()) + list(enc.parameters()) if p.requires_grad]
     lr = cfg.lr * (batch / cfg.batch) ** 0.5
     opt = torch.optim.Adam(params, lr=lr)
@@ -75,19 +77,42 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None):
             map_emb = enc(m, z=z) if z is not None else enc(m)
             pred = model(xt, t, map_emb, s, g)
         loss = nn.functional.mse_loss(pred.float(), noise)
+        postfix = {"loss": f"{loss.item():.4f}"}
+        if pen is not None:
+            x0h = pred_x0(xt.float(), pred.float(), sch, t)
+            sdf_m = m[:, 1:2] * pen["sdf_clip"]
+            tp = traj_penalty_terms(x0h, sdf_m, pen["bbox"], pen["veh"],
+                                    pen["foot"], pen["margin"])
+            gate = sch["abar"][t]                     # (B,) x0_hat 可靠度(t 小→~1)
+            aux = (pen["w_nh"] * (gate * tp["nh"]).mean()
+                   + pen["w_curv"] * (gate * tp["curv"]).mean()
+                   + pen["w_coll"] * (gate * tp["coll"]).mean())
+            loss = loss + aux
+            postfix.update(nh=f"{tp['nh'].mean().item():.3f}",
+                           curv=f"{tp['curv'].mean().item():.3f}",
+                           coll=f"{tp['coll'].mean().item():.3f}")
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt); scaler.update()
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        pbar.set_postfix(**postfix)
     return model, enc
 
 
 # --------------------------------------------------------------------------- #
 # 主入口
 # --------------------------------------------------------------------------- #
-def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKPT):
+def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKPT,
+         w_nh=None, w_curv=None, w_coll=None, coll_margin=None):
     cfg = default_config()
     dc = cfg.diffusion
+    if w_nh is not None:
+        dc.w_nh = w_nh
+    if w_curv is not None:
+        dc.w_curv = w_curv
+    if w_coll is not None:
+        dc.w_coll = w_coll
+    if coll_margin is not None:
+        dc.coll_margin = coll_margin
     if npz_path is None:
         cdir = os.path.join(_REPO, cfg.data.cache_dir)
         cands = sorted([f for f in os.listdir(cdir)
@@ -123,8 +148,18 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
         sum(p.numel() for p in enc.parameters() if p.requires_grad)
     print("[model] trainable params=%.1fK" % (npar / 1e3))
 
+    pen = None
+    if dc.w_nh or dc.w_curv or dc.w_coll:
+        veh = Vehicle(cfg.vehicle)
+        foot = torch.tensor(veh.footprint_local, dtype=torch.float32, device=device)
+        pen = dict(w_nh=dc.w_nh, w_curv=dc.w_curv, w_coll=dc.w_coll,
+                   margin=dc.coll_margin, foot=foot, veh=cfg.vehicle,
+                   bbox=bbox, sdf_clip=SDF_CLIP)
+        print("[pen] aux traj loss nh=%g curv=%g coll=%g margin=%.2f clip=%.1fm"
+              % (dc.w_nh, dc.w_curv, dc.w_coll, dc.coll_margin, SDF_CLIP))
+
     sch = make_schedule(dc.t_steps, dc.b0, dc.b1, device)
-    train(model, enc, x0, maps, s4, g4, sch, dc, steps=steps, batch=batch, lat=lat)
+    train(model, enc, x0, maps, s4, g4, sch, dc, steps=steps, batch=batch, lat=lat, pen=pen)
 
     os.makedirs(os.path.dirname(out), exist_ok=True)
     torch.save({"model": model.state_dict(), "enc": enc.state_dict(),
@@ -150,5 +185,10 @@ if __name__ == "__main__":
     ap.add_argument("--cond", choices=["lat", "cnn"], default="lat")
     ap.add_argument("--out", type=str, default=CKPT)
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--w-nh", type=float, default=None, help="Phase2 航向一致性损失权重(0=关)")
+    ap.add_argument("--w-curv", type=float, default=None, help="Phase2 曲率超限损失权重(0=关)")
+    ap.add_argument("--w-coll", type=float, default=None, help="Phase2 足迹碰撞损失权重(0=关)")
+    ap.add_argument("--coll-margin", type=float, default=None, help="足迹碰撞安全间隙(m)")
     a = ap.parse_args()
-    main(a.npz, a.steps, a.batch, a.cond, a.quick, a.out)
+    main(a.npz, a.steps, a.batch, a.cond, a.quick, a.out,
+         w_nh=a.w_nh, w_curv=a.w_curv, w_coll=a.w_coll, coll_margin=a.coll_margin)
