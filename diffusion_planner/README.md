@@ -5,8 +5,8 @@
 逆过程,从纯噪声直接生成航点路径。附带一个**地图 VAE**(图→隐向量→还原图)演示
 Latent-Diffusion 里的编解码组件。
 
-- 运行环境:`venv_py38`(与本目录同级),GPU = **RTX 4060 Laptop 8GB**
-- 训练一次完整模型:数据集生成约 24 分钟(一次性)+ 训练约 10 分钟
+- 运行环境:Python 3.8 + PyTorch 2.4.1+cu121,本仓库用 `venv_py38`(与代码同级、已 gitignore),GPU = **RTX 4060 Laptop 8GB**
+- 训练一次完整模型:数据集生成约 24 分钟(一次性、可复用)+ 地图 VAE 约 5 分钟 + 规划器训练约 1~2 分钟(AMP+大batch 提速后)
 
 ---
 
@@ -55,9 +55,11 @@ diffusion_planner_demo/
     ├── diffusion_toy.py       # 入门:2D 玩具数据上的最小 DDPM(加噪/去噪演示)
     ├── vae_map.py             # 占据栅格地图 VAE(编码/解码)
     ├── README.md              # 本文件
-    ├── dataset_<M>.npz        # 数据集缓存(按样本数命名)
+    ├── VAE_NOTES.md           # VAE 改动主线 + 踩坑记录
+    ├── PLANNER_NOTES.md       # 规划器改动记录(通俗版)
+    ├── dataset_<M>.npz        # 数据集缓存(按样本数命名,已 gitignore)
     ├── planner_ckpt.pt        # 扩散规划器权重
-    ├── vae_map.pt             # VAE 权重(约 884 KB)
+    ├── vae_map.pt             # VAE 权重(约 1.8 MB,冻结后供规划器当条件)
     └── figs/                  # 各脚本效果图(按脚本分子目录)
         ├── diffusion_toy/     #   fig_forward.png, fig_generated.png, fig_denoise.gif
         ├── diffusion_path/    #   fig_planner.png(生成路径 vs A*)
@@ -105,11 +107,12 @@ diffusion_planner_demo/
 | 扩散步数 T | 200 |
 | 噪声调度 | 线性 beta `1e-4 → 0.02` |
 | 前向 | `x_t = √ᾱ_t·x₀ + √(1-ᾱ_t)·ε`(重参数化) |
-| 去噪网络 | CNN 地图编码器(→64维)+ MLP(hidden=512),预测噪声 ε |
+| 去噪网络 | MLP(hidden=512)预测噪声 ε;地图条件由 `--cond` 选择 |
+| 地图条件 | **默认 `lat`**:冻结 VAE 的 8×8×8 latent(→Linear 32 维)⊕ 显式 SDF 小 CNN(→32 维)= 64 维 map_emb;`cnn`:原始 2 通道 CNN MapEncoder(基线) |
 | 条件注入 | concat `[x_t, 时间嵌入(64), 地图嵌入(64), start(2), goal(2)]` |
 | 采样 | 祖先采样(ancestral DDPM),每步**钉住首尾航点** = start/goal |
 | 后处理 | 用 SDF 梯度把航点推离障碍 + 拉普拉斯平滑(`repair_path`) |
-| 训练 | 40000 步,batch=256,lr=2e-4,4060 上约 10 分钟,loss≈0.025 |
+| 训练 | 默认 batch=512(lr 随 batch 按√ 自适应)+ **AMP 混合精度** + **预存冻结 latent**;提速后 10000 步约 1 分钟 |
 
 **评估指标**:无碰撞率(路径不穿黑格)、长度比(生成路径 / A\* 路径)。
 
@@ -120,13 +123,15 @@ diffusion_planner_demo/
 | 项 | 值 |
 |----|----|
 | 输入 | 64×64 占据图(通道0) |
-| 隐向量 latent | **32** 维 |
-| 编码器 | 3 层卷积下采样 64→8,输出 mu/logvar |
-| 解码器 | 3 层转置卷积上采样 8→64,sigmoid 重建 |
-| 损失 | BCE 重建 + KL 散度 |
-| 训练 | 2000 张地图,30 epoch,batch=64,几十秒 |
-| 权重体积 | 约 **884 KB** |
-| 效果 | 能大致还原障碍布局与位置,边缘偏模糊(小 latent 的正常表现) |
+| 隐变量 latent | **空间特征图 8×8×8**(`LAT_CH=8`,下采样 8×,非全局向量) |
+| 编码器 | 4 级卷积 64→32→16→8,通道 `CH=(16,32,48,64)`,级间 **GroupNorm+SiLU 残差块**;输出 mu/logvar |
+| 解码器 | 转置卷积 8→16→32→64 + 残差块,sigmoid 重建(无 U-Net skip) |
+| 参数量 | 约 **444 K**(旧版 ~5.0 M 的 1/11) |
+| 损失 | **加权 BCE 重建**(pos_weight=3,障碍类)+ **小权重 KL**(β=1e-2),两项均**逐样本求和**避免后验塌缩 |
+| 训练 | 10000 张地图,60 epoch,batch=64,约 5~6 分钟 |
+| 权重体积 | 约 **1.8 MB** |
+| 量化指标 | 像素准确率 **99.66%**、障碍类 **IoU 98.23%**(eval 200 张) |
+| 效果 | 障碍块/散点基本对齐,重建近乎无损;VAE 作为**独立模块训好后冻结**,供规划器当条件 |
 
 ---
 
@@ -141,32 +146,37 @@ cd diffusion_planner
 # 1) 生成数据集(最耗时,一次性;带进度条)
 python make_dataset.py --data 20000
 
-# 2) 训练扩散规划器 + 采样评估渲染
-python diffusion_path.py --data 20000 --train 40000
-#   产物: figs/diffusion_path/fig_planner.png, planner_ckpt.pt
-
-# 3) 训练地图 VAE(复用已有数据集)
+# 2) 训练地图 VAE(复用已有数据集;--cond lat 需要它)
 python vae_map.py
 #   产物: figs/vae_map/fig_vae.png, vae_map.pt
 
-# 快速验证(1~2 分钟, 效果仅供跑通流程)
+# 3) 训练扩散规划器 + 采样评估渲染(默认 --cond lat, 加载冻结 vae_map.pt)
+python diffusion_path.py --data 20000 --train 20000 --batch 512 --cond lat
+#   基线对比(不依赖 VAE): --cond cnn
+#   产物: figs/diffusion_path/fig_planner.png, planner_ckpt.pt
+
+# 快速验证(几十秒~2 分钟, 效果仅供跑通流程)
 python diffusion_path.py --quick
 ```
 
 常用参数:
 - `make_dataset.py --data N [--overwrite]`
-- `diffusion_path.py --data N --train STEPS [--regen] [--quick]`
+- `diffusion_path.py --data N --train STEPS [--batch B] [--cond {lat,cnn}] [--regen] [--quick]`
+- `vae_map.py`(参数在文件头部常量区,如 `CH`/`LAT_CH`/`EPOCHS`/`BETA`)
 
 ---
 
 ## 6. 当前结果与已知问题
 
-- 扩散规划器(40000 步训练,loss≈0.025):**无碰撞率 5/8,长度比 0.98**。
+- 扩散规划器(**仅 8 个评估样本,数字噪声大**):
+  - `--cond lat`(冻结 VAE latent + SDF):无碰撞率 **5~6/8**,长度比 ≈ 0.98~0.99
+  - `--cond cnn`(原始 CNN 基线):无碰撞率 **3/8**,长度比 ≈ 1.00
+  - latent 分支还更快(预存 VAE → 热循环不跑 VAE,161 vs 49 步/s)。
+- 地图 VAE:像素准确率 **99.66%**、障碍 **IoU 98.23%**,重建近乎无损。
 - **已知问题**:长度比 < 1 说明生成路径在**抄近道穿障碍**,是碰撞主因。
-  根因:① 专家 A\* 路径贴障碍角、无安全间隙;② 地图条件经全局池化后丢失精细
-  空间信息;③ 训练目标只有噪声 MSE,缺避障信号。
-- **改进方向(待做)**:C 空间障碍膨胀、逐航点局部 SDF 条件、避障损失/采样引导、
-  更强后处理修复。
+  根因:① 专家 A\* 路径贴障碍角、无安全间隙;② 训练目标只有噪声 MSE,缺避障信号。
+- **改进方向(Phase 2,待做)**:C 空间障碍膨胀、逐航点局部 SDF 条件、避障损失/采样引导、
+  更强后处理修复;并把评估样本从 8 提到 ~50 才有统计意义。
 
 ---
 
