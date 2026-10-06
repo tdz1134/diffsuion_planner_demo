@@ -169,7 +169,18 @@ def load_model(ckpt=CKPT, cfg=None):
     return model, enc, blob.get("bbox", (0, 0, cfg.lot.world_w, cfg.lot.world_h)), cond
 
 
-def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw=None):
+def load_critic(path):
+    """加载训好的可行性判别器(Phase 4 / M12)供 classifier guidance。维度全从 ckpt 自抝。"""
+    from .critic import FeasibilityCritic
+    blob = torch.load(path, map_location=device, weights_only=False)
+    crit = FeasibilityCritic(blob["n_wp"], dim=blob["dim"], map_emb=blob["map_emb"],
+                             hidden=blob["hidden"], layers=blob["layers"],
+                             cond_ch=blob["cond_ch"]).to(device)
+    crit.load_state_dict(blob["critic"]); crit.eval()
+    return crit
+
+
+def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw=None, ckw=None):
     cfg = default_config()
     dc = cfg.diffusion
     veh = Vehicle(cfg.vehicle)
@@ -209,7 +220,12 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
                      w_nh=gkw.get("nh", 0.0), w_curv=gkw.get("curv", 0.0),
                      w_coll=gkw.get("coll", 0.0), scale=gkw["scale"],
                      margin=gkw.get("margin", 0.15), min_abar=gkw.get("min_abar", 0.1))
-    gen_n = sample(model, enc, maps_t, s4, g4, sch, z=lat, guide=guide).cpu().numpy()   # (k,N,4) norm
+    critic = None; c_scale = 0.0; c_minabar = 0.9
+    if ckw and ckw.get("scale", 0) > 0 and ckw.get("path"):
+        critic = load_critic(ckw["path"]); c_scale = float(ckw["scale"])
+        c_minabar = float(ckw.get("min_abar", 0.9))
+    gen_n = sample(model, enc, maps_t, s4, g4, sch, z=lat, guide=guide,
+                   critic=critic, critic_scale=c_scale, critic_min_abar=c_minabar).cpu().numpy()   # (k,N,4) norm
 
     res = cfg.lot.res
     n_col = n_feas = n_ok = 0
@@ -247,6 +263,7 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
     metrics = dict(
         k=k, cond=cond,
         guided=float(gkw.get("scale", 0.0)) if gkw else 0.0,
+        critic_scale=float(c_scale),
         raw_collision_free=n_col / k, raw_feasible=n_feas / k, raw_success=n_ok / k,
         raw_len_ratio=float(np.mean(ratios)), raw_mean_slip=float(np.mean(slips)),
         raw_seg_kappa=float(np.mean(maxks)), raw_gear_switches=float(np.mean(nsegs)),
@@ -307,12 +324,16 @@ if __name__ == "__main__":
     ap.add_argument("--g-nh", type=float, default=0.0, help="引导中航向一致性代价权重")
     ap.add_argument("--g-margin", type=float, default=0.15, help="引导碰撞安全间隙(m)")
     ap.add_argument("--g-min-abar", type=float, default=0.1, help="仅在 abar>=此值(低噪)时引导")
+    ap.add_argument("--critic", type=str, default=None, help="可行性判别器 ckpt(classifier guidance)")
+    ap.add_argument("--c-scale", type=float, default=0.0, help="判别器引导步长(0=关)")
+    ap.add_argument("--c-min-abar", type=float, default=0.9, help="仅在 abar>=此值(晚步)时进判别器引导")
     a = ap.parse_args()
     out = a.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "figs", "parking", "m6_eval_compare.png")
     gkw = dict(scale=a.g_scale, curv=a.g_curv, coll=a.g_coll, nh=a.g_nh,
                margin=a.g_margin, min_abar=a.g_min_abar)
-    m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out, gkw=gkw)
+    ckw = dict(path=a.critic, scale=a.c_scale, min_abar=a.c_min_abar)
+    m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out, gkw=gkw, ckw=ckw)
     for kk, v in m.items():
         print("  %-22s %s" % (kk, round(v, 4) if isinstance(v, float) else v))
     print("[saved] %s" % out)

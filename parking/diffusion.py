@@ -127,15 +127,22 @@ def build_denoiser(dc):
                         hidden=dc.hidden)
 
 
-def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None):
+def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None,
+           critic=None, critic_scale=0.0, critic_min_abar=0.9):
     """反向去噪采样。每步钉住首尾位姿(含朝向)。返回 (B,N,4) 归一化轨迹。
 
     guide=None 为纯 DDPM。否则每步在**预测 x0_hat** 上算轨迹代价(曲率/足迹碰撞/航向)的梯度,
     后推至后验均值 mean -= scale * dCost/dx —— 不改变训练与已学 score(sampler-safe 推理引导)。
     guide 需包含: veh, bbox, foot(P,2 tensor), sdf_clip, w_nh/w_curv/w_coll, scale, margin, min_abar。
+
+    critic 为已训好的 FeasibilityCritic 时(Phase 4 / M12): 晚步(abar>=critic_min_abar)在 x0_hat 上
+    算 logit=可行度, 沿 **梯度上升**推后验均值 mean += critic_scale * d(logit)/dx(classifier guidance)。
+    与 guide 可共存; critic 的梯度只依赖学出的平滑判别器, 避免手写几何代价的病态发散。
     """
     B = maps.shape[0]
     model.eval(); enc.eval()
+    if critic is not None:
+        critic.eval()
     with torch.no_grad():
         map_emb = enc(maps, z=z) if z is not None else enc(maps)
     T = sch["T"]
@@ -161,6 +168,12 @@ def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None)
                         x0h, sdf_m, guide["bbox"], guide["foot"], guide["margin"]))
             g = torch.autograd.grad(cost.sum(), xg)[0]
             mean = mean - guide["scale"] * g
+        if critic is not None and critic_scale != 0.0 and float(sch["abar"][t]) >= critic_min_abar:
+            # 噪声感知 critic: 直接看 x_t(与采样器所见同分布), 梯度关于 x_t(标准 classifier guidance)。
+            xg = x.detach().requires_grad_(True)
+            logit = critic(xg, map_emb, starts4, goals4)
+            g = torch.autograd.grad(logit.sum(), xg)[0]
+            mean = mean + critic_scale * g
         if t > 0:
             x = mean + torch.sqrt(sch["betas"][t]) * torch.randn_like(x)
         else:
