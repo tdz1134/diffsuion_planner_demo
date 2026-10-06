@@ -100,8 +100,11 @@ def _cat(parts):
 # 主入口
 # --------------------------------------------------------------------------- #
 def build_dataset(cfg: ParkingConfig = None, n: int = None, n_proc: int = None,
-                  out_path: str = None, seed: int = None, verbose: bool = True):
+                  out_path: str = None, seed: int = None, verbose: bool = True,
+                  n_wp: int = None):
     cfg = cfg or default_config()
+    if n_wp is not None:                       # 覆盖定长航点数(默认沿用 cfg=40, 向后兼容)
+        cfg.diffusion.n_wp = int(n_wp)
     n = cfg.data.n_samples if n is None else int(n)
     seed = cfg.data.seed if seed is None else int(seed)
     n_proc = (cpu_count() if cfg.data.n_proc == 0 else cfg.data.n_proc) if n_proc is None else int(n_proc)
@@ -191,7 +194,8 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--quick", action="store_true", help="小样本冒烟")
+    ap.add_argument("--n_wp", type=int, default=None, help="定长航点数 N(默认沿用 config=40)")
     a = ap.parse_args()
     n = 200 if a.quick else a.n
     build_dataset(default_config(), n=n, n_proc=(2 if a.quick else a.proc),
-                  seed=a.seed, out_path=a.out)
+                  seed=a.seed, out_path=a.out, n_wp=a.n_wp)

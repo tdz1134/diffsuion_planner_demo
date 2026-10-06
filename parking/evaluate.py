@@ -162,6 +162,7 @@ def load_model(ckpt=CKPT, cfg=None):
         enc = MapEncoderCNN(out_dim=dc.map_emb).to(device)
     enc.load_state_dict(blob["enc"])
     dc.denoiser = blob.get("denoiser", "mlp")     # 旧 ckpt 无此字段 -> mlp(向后兼容)
+    dc.n_wp = int(blob.get("n_wp", dc.n_wp))       # N 随 ckpt(旧 40/缺省 40, N=80 自动 80)
     model = build_denoiser(dc).to(device)
     model.load_state_dict(blob["model"])
     model.eval(); enc.eval()

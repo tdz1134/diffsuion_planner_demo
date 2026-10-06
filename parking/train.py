@@ -102,7 +102,7 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
 # 主入口
 # --------------------------------------------------------------------------- #
 def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKPT,
-         w_nh=None, w_curv=None, w_coll=None, coll_margin=None, denoiser=None):
+         w_nh=None, w_curv=None, w_coll=None, coll_margin=None, denoiser=None, n_wp=None):
     cfg = default_config()
     dc = cfg.diffusion
     if denoiser is not None:
@@ -126,6 +126,8 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
 
     d = load_dataset(npz_path)
     bbox = tuple(float(v) for v in d["bbox"])
+    # 从数据自身推导定长 N(=traj 第2维): 旧 40 数据仍得 40, N=80 数据自动得 80。
+    dc.n_wp = int(n_wp) if n_wp else int(d["traj"].shape[1])
     tr_mask = d["split"] == 0
     maps = torch.tensor(d["maps"][tr_mask], device=device)
     x0 = torch.tensor(norm_traj4(d["traj"][tr_mask], bbox), device=device)
@@ -193,7 +195,9 @@ if __name__ == "__main__":
     ap.add_argument("--coll-margin", type=float, default=None, help="足迹碰撞安全间隙(m)")
     ap.add_argument("--denoiser", choices=["mlp", "conv"], default=None,
                     help="去噪器架构(Phase3): conv=1D 时序卷积; 缺省用 config(mlp)")
+    ap.add_argument("--n-wp", type=int, default=None,
+                    help="定长航点数 N; 缺省自动从数据 traj 推导(向后兼容)")
     a = ap.parse_args()
     main(a.npz, a.steps, a.batch, a.cond, a.quick, a.out,
          w_nh=a.w_nh, w_curv=a.w_curv, w_coll=a.w_coll, coll_margin=a.coll_margin,
-         denoiser=a.denoiser)
+         denoiser=a.denoiser, n_wp=a.n_wp)
