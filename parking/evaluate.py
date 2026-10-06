@@ -20,7 +20,8 @@ import torch
 from .config import default_config
 from .dataset import load_dataset, SDF_CLIP
 from .geometry import (denormalize_xy, cs_to_heading, cum_arclen,
-                       curvature_from_poses, path_length, wrap, pose_error)
+                       curvature_from_poses, path_length, wrap, pose_error,
+                       resample_poses)
 from .vehicle import Vehicle
 from .conditioner import MapConditioner, MapEncoderCNN
 from .diffusion import make_schedule, build_denoiser, sample
@@ -30,11 +31,14 @@ from .render import render_scene
 from .repair import repair_waypoints
 from .interfaces import Scenario
 
-DENSE = 200          # 稠密化点数(碰撞/曲率)
-KAPPA_TOL = 1.2      # 曲率容差倍数(仅诊断报告用; 定长N+弦稠密化在换档尖点会虚高, 不作可行性判据)
+DENSE = 200          # 稠密化点数(碰撞/滑移)
+KAPPA_TOL = 1.2      # 曲率容差倍数: 分段曲率判据阈 = KAPPA_TOL / r_min
 SLIP_TOL = 0.2       # 非完整性(横向滑移)判据: 逐段 |sin(运动方向-航向)| 上限(~11.5°)
 MIN_MOVE = 0.05      # 逐段滑移统计时忽略小于此位移(m)的近似静止段(换档尖点)
-JUMP_TOL = 0.35      # (保留: 旧诊断量, 不再参与可行性判定)
+CURV_STEP = 0.20     # 分段曲率(位置 Menger)重采样的均匀弧长步长(m): 粗步长避免稀疏航点重加密引入的毛刺放大
+MIN_SEG_LEN = 0.3    # 短于此弧长(m)的子段不计入曲率(噪声/尖点残留)
+SEG_PTS_MIN = 4      # 一段重采样后至少这么多点才谈得上可靠曲率
+JUMP_TOL = 0.35      # (保留: 旧诊断量, 不参与判定)
 REPAIR_MARGIN = 1.2  # 修复时中心到障碍的安全距离(m)
 
 
@@ -81,14 +85,66 @@ def nonholonomy_slip(poses, min_move=MIN_MOVE):
     return float(slip.mean()), float(slip.max())
 
 
+def segment_by_cusps(poses):
+    """按运动方向相对航向的前/后反转(=换档尖点)把序列切成若干子段(索引区间 [i,j])。
+    尖点视为合法停顿: 不在尖点上算曲率。前进(dot>0)与倒车(dot<0)分段, 侧滑(dot≈0)不分段
+    (交给滑移判据)。返回 [(i, j), ...]。"""
+    poses = np.asarray(poses, dtype=np.float64)
+    n = poses.shape[0]
+    if n < 2:
+        return [(0, n)]
+    dx = np.diff(poses[:, 0]); dy = np.diff(poses[:, 1])
+    th = poses[:-1, 2]
+    along = dx * np.cos(th) + dy * np.sin(th)          # 运动在航向上的有符号投影
+    stat = np.abs(along) < MIN_MOVE                    # 近静止(尖点附近)
+    sign = np.where(stat, 0, np.sign(along)).astype(int)
+    segs = []; start = 0; cur = 0
+    for i in range(len(sign)):
+        if sign[i] != 0:
+            if cur == 0:
+                cur = sign[i]
+            elif sign[i] != cur:
+                segs.append((start, i + 1)); start = i; cur = sign[i]
+    segs.append((start, n))
+    return segs
+
+
+def _menger_max(xy):
+    """逐三点外接圆(位置)曲率最大值; 对重采样的尖点/噪声比航向微分更稳。"""
+    if xy.shape[0] < 3:
+        return 0.0
+    a, b, c = xy[:-2], xy[1:-1], xy[2:]
+    ab = np.linalg.norm(b - a, axis=1); bc = np.linalg.norm(c - b, axis=1); ca = np.linalg.norm(c - a, axis=1)
+    cross = np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    den = ab * bc * ca
+    kk = np.where(den > 1e-9, cross / den, 0.0)
+    return float(kk.max()) if kk.size else 0.0
+
+
+def segment_metrics(poses, step=CURV_STEP):
+    """用户方法: 先按换档尖点切割, 每段重采样后取最大 |κ|(位置 Menger)。返回 (seg_max_kappa, n_seg)。
+    诚实注: 定长 N=40 对曲率**天然欠分辨**(紧入口塔缩成稀疏航点), 连专家都读出 κ≈1.45(真值应≤0.22);
+    故本值只用于**相对比较/诊断**(专家<CONV<MLP 排序正确), 不作绝对可行性硬门。尖点数 n_seg 则是可靠质量信号。"""
+    poses = np.asarray(poses, dtype=np.float64)
+    worst = 0.0; nseg = 0
+    for i, j in segment_by_cusps(poses):
+        seg = poses[i:j]
+        if seg.shape[0] < 2 or float(cum_arclen(seg[:, :2])[-1]) < MIN_SEG_LEN:
+            continue
+        nseg += 1
+        m = max(3, int(np.ceil(cum_arclen(seg[:, :2])[-1] / step)) + 1)
+        worst = max(worst, _menger_max(resample_poses(seg, m)[:, :2]))
+    return worst, nseg
+
+
 def feasibility(poses, r_min):
-    """返回 (feasible, mean_slip, max|kappa|)。feasible = 横向滑移达标(max|slip|<=SLIP_TOL)。
-    kappa 仅作诊断(定长 N+弦稠密化使含尖点的真实可行路径曲率虚高, 不能当判据)。"""
+    """返回 (feasible, mean_slip, seg_kappa, n_seg)。
+    feasible = 非完整性滑移达标(max|slip|<=SLIP_TOL) —— 这是定长 N 上唯一对尖点/采样密度免疫的硬判据。
+    seg_kappa/n_seg 作为诊断输出(尖点分段后的位置曲率与换档次数), 不参与硬门。"""
     mean_slip, max_slip = nonholonomy_slip(poses)
-    kap = curvature_from_poses(poses)
-    max_k = float(np.abs(kap).max())
+    seg_k, nseg = segment_metrics(poses)
     ok = (max_slip <= SLIP_TOL)
-    return ok, mean_slip, max_k
+    return ok, mean_slip, seg_k, nseg
 
 
 # --------------------------------------------------------------------------- #
@@ -157,8 +213,8 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
     res = cfg.lot.res
     n_col = n_feas = n_ok = 0
     r_col = r_feas = r_ok = 0
-    ratios = []; maxks = []; slips = []; epos = []; eang = []
-    r_ratios = []; r_maxks = []; r_slips = []
+    ratios = []; maxks = []; slips = []; nsegs = []; epos = []; eang = []
+    r_ratios = []; r_maxks = []; r_slips = []; r_nsegs = []
     cases = []
     for i in range(k):
         grid = maps[i, 0]
@@ -168,19 +224,19 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         # --- 原始 ---
         gposes = densify_traj4(gen4)
         col = footprint_collides(grid, gposes, veh, res)
-        feas, mslip, mk = feasibility(gposes, veh.cfg.r_min)
+        feas, mslip, mk, nseg = feasibility(gposes, veh.cfg.r_min)
         glen = path_length(gposes)
         n_col += (not col); n_feas += feas; n_ok += (not col and feas)
-        ratios.append(glen / max(length[i], 1e-6)); maxks.append(mk); slips.append(mslip)
+        ratios.append(glen / max(length[i], 1e-6)); maxks.append(mk); slips.append(mslip); nsegs.append(nseg)
         pe, ae = pose_error(gposes[-1], gp[i]); epos.append(pe); eang.append(ae)
         # --- 修复后 ---
         rep4 = repair_waypoints(gen4, grid, res, margin=REPAIR_MARGIN)
         rposes = densify_traj4(rep4)
         rcol = footprint_collides(grid, rposes, veh, res)
-        rfeas, rmslip, rmk = feasibility(rposes, veh.cfg.r_min)
+        rfeas, rmslip, rmk, rnseg = feasibility(rposes, veh.cfg.r_min)
         rglen = path_length(rposes)
         r_col += (not rcol); r_feas += rfeas; r_ok += (not rcol and rfeas)
-        r_ratios.append(rglen / max(length[i], 1e-6)); r_maxks.append(rmk); r_slips.append(rmslip)
+        r_ratios.append(rglen / max(length[i], 1e-6)); r_maxks.append(rmk); r_slips.append(rmslip); r_nsegs.append(rnseg)
         if i < n_viz:
             sc = Scenario(grid=grid, res=res, start_pose=sp[i], goal_pose=gp[i],
                           scene_type=("perp" if stype[i] == 0 else "par"), bbox=bbox)
@@ -192,10 +248,10 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         guided=float(gkw.get("scale", 0.0)) if gkw else 0.0,
         raw_collision_free=n_col / k, raw_feasible=n_feas / k, raw_success=n_ok / k,
         raw_len_ratio=float(np.mean(ratios)), raw_mean_slip=float(np.mean(slips)),
-        raw_max_kappa=float(np.mean(maxks)),
+        raw_seg_kappa=float(np.mean(maxks)), raw_gear_switches=float(np.mean(nsegs)),
         rep_collision_free=r_col / k, rep_feasible=r_feas / k, rep_success=r_ok / k,
         rep_len_ratio=float(np.mean(r_ratios)), rep_mean_slip=float(np.mean(r_slips)),
-        rep_max_kappa=float(np.mean(r_maxks)),
+        rep_seg_kappa=float(np.mean(r_maxks)), rep_gear_switches=float(np.mean(r_nsegs)),
         slip_tol=SLIP_TOL,
         kappa_limit=1.0 / veh.cfg.r_min,
         mean_end_pos_err_m=float(np.mean(epos)),
