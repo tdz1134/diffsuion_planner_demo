@@ -1,0 +1,16 @@
+# 虚拟环境(几百 MB,绝不上传;对方按 README 自建环境)
+venv_py38/
+../venv_py38/
+
+# Python 运行产物
+__pycache__/
+*.pyc
+
+# 生成的数据集(可用 make_dataset.py 重新生成,体积大)
+*.npz
+
+# 日志 / 临时
+*.log
+
+# 系统文件
+.DS_Store
