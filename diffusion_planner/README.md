@@ -48,7 +48,9 @@ python diffusion_path.py --data 20000 --train 20000 --batch 512 --cond lat
 ```
 diffusion_planner_demo/
 ├── venv_py38/                 # Python 虚拟环境(PyTorch 2.4.1+cu121)
-└── diffusion_planner/         # 本项目
+├── PARKING_NOTES.md           # 泊车规划(parking/)搭建记录(通俗版, 每改必记)
+├── parking/                   # 【新增】泊车扩散规划器(独立包, 见 §7)
+└── diffusion_planner/         # 占据栅格路径 demo(下述各节)
     ├── grid_env.py            # 地图生成 + A*/加权A*/贪心 + 距离场 + 路径重采样
     ├── make_dataset.py        # 数据集生成(独立、最耗时,带进度条)
     ├── diffusion_path.py      # 条件扩散路径规划器(训练+采样+修复+评估+渲染)
@@ -180,7 +182,49 @@ python diffusion_path.py --quick
 
 ---
 
-## 7. 环境依赖
+## 7. 泊车规划(parking/,新增)
+
+在**真实车位场景**(垂直入库 / 平行侧方)里做泊车轨迹规划:用**混合 A\*(HA\*)**当"老师"
+开出可行轨迹 → 攒数据集 → 训一个**条件扩散模型**,以后给它 车位图 + 起点 + 终点,直接"画"出
+一条**定长 40 点**的 SE(2) 轨迹 `(x, y, cosθ, sinθ)`。
+
+- **独立新包**,`diffusion_planner/` demo **一行没动**;只**复用**其中已验证的地图 VAE 类与扩散调度思路。
+- **算法/接口分离**:HA\*、场景生成、后处理、地图编码、扩散模型都是可替换插件(ABC + dataclass 注入)。
+- 详细搭建记录见仓库根 **`PARKING_NOTES.md`**(通俗版)。
+
+### 7.1 流程与运行(仓库根目录)
+```bash
+cd /home/t/projects/diffusion_planner_demo
+venv_py38/bin/python -m parking.dataset  --n 4000 --proc 8            # ① HA* 造数据(多进程) → cache/parking_4000.npz
+venv_py38/bin/python -m parking.map_vae  --npz cache/parking_4000.npz # ② 泊车地图重训 VAE 并冻结 → parking/cache/vae_parking.pt
+venv_py38/bin/python -m parking.train    --npz cache/parking_4000.npz --steps 12000  # ③ 训扩散 → parking/cache/diffusion_parking.pt
+venv_py38/bin/python -m parking.evaluate --npz cache/parking_4000.npz # ④ 评估 + 对比图 → figs/parking/m6_eval_compare.png
+```
+> 每个模块都可 `venv_py38/bin/python -m parking.<模块>` 跑自带小测;`evaluate` 要用与 `train` 相同的 npz。
+
+### 7.2 关键参数
+| 项 | 值 |
+|----|----|
+| 轨迹表示 | 定长 **N=40** 个 `(x, y, cosθ, sinθ)`,世界单位米;首尾钉住 start/goal |
+| 地图 | 占据栅格 **72×128**(8 的倍数,复用 VAE 的 3 次 /2 下采样),分辨率 0.2 m;通道 [占据, SDF] |
+| 老师 HA\* | 自行车模型基元 + 足迹(旋转矩形)碰撞 + holonomic 场启发;整段 numba `@njit`,**0.078 s/条**(比纯 Python 快 ~240×) |
+| 数据集 | 多进程并行;HA\* 求解成功率 **0.76~0.80**(失败丢弃重采);12000 条 / 16 进程 ≈ 139 s |
+| 地图 VAE | 复用 `vae_map.py` 的 VAE,在泊车占据图上**重训→冻结**:像素准确率 **99.80%**、障碍 IoU **99.13%** |
+| 扩散 | DDPM(ε-pred),T=200,线性 beta 1e-4→0.02;MLP 去噪器(hidden 512,可训练 **805.8K**);条件 = 冻结 VAE latent ⊕ SDF(64 维)+ 起终点 + 时间;采样每步钉首尾;复用 AMP + 大 batch + 预存 latent |
+| 评估指标 | **足迹**(旋转矩形)无碰撞率、运动学可行性(\|κ\|≤1.2/r_min)、成功率、长度比 vs HA\*、终点误差 |
+
+### 7.3 当前结果(诚实)
+- **HA\* 老师本身 100% 可行无碰撞**(它就是数据源),渲染对比图见 `figs/parking/`。
+- **扩散 Phase 1(纯 ε-MSE)原始输出不可行**:无碰撞 ~1.7%、可行 0%、最大曲率远超上限;
+  采样后**修复**(`repair.py`:SDF 外推 + 拉普拉斯平滑 + 钉端点)把无碰撞率抬到 ~20~30%,但可行性仍低。
+- **加数据(4k→12k)+ 加步数(12k→30k)重训并没有救回可行性** → 瓶颈不在数据量,而在
+  **ε-MSE 目标 + MLP 去噪器**对"尖锐、多模态"泊车轨迹的 averaging。
+- **改进方向(Phase 2,待做)**:曲率/避障进训练损失、采样时 SDF/C 空间引导、按足迹做 C 空间膨胀的更强修复、
+  去噪器升级 MLP→1D-Conv/小 Transformer。详见 `PARKING_NOTES.md` §5。
+
+---
+
+## 8. 环境依赖
 
 `venv_py38`(Python 3.8.10):
 - torch 2.4.1+cu121(CUDA 12.1,已验证 RTX 4060 可用)
