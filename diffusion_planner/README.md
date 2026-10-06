@@ -226,7 +226,10 @@ venv_py38/bin/python -m parking.evaluate --npz cache/parking_4000.npz # ④ 评�
 - **Phase 2 已试(诚实,均未突破端到端可行)**:
   - *训练内惩罚*(把曲率/航向/足迹碰撞的可微代价加进 ε-MSE,`penalty.py`):**两组权重都让 DDPM 采样器发散**(长度比 600~870 的螺旋、碰撞率反而 0%)——轨迹代价会系统性偏置学出的 score。已回滚权重。
   - *采样引导*(`evaluate --g-*`,晚步 `min_abar`高、仅碰撞):**安全的 Pareto 改善**——原始无碰撞率 **1.7%→25%**、修复后 →~32%,最大曲率 4.8→3.5,长度比稳定不发散;但**运动学可行性仍 0%**(曲率离上限差 ~15×),端到端成功率仍 0。加曲率/航向项到引导会立刻发散(同上 ill-conditioning)。对比图 `figs/parking/m8_guided_compare.png`。
-- **真正的后续**:瓶颈是**运动学可行性(正确的倒车几何)**而非避障;需去噪器升级 MLP→1D-Conv/小 Transformer + **在 score 空间做正确的 classifier guidance**,而非把几何代价硬塞进 ε-MSE 或 x0 梯度。详见 `PARKING_NOTES.md` §5/M8。
+- **Phase 3 去噪器升级 MLP→1D 时序卷积 + 修正可行性度量(诚实重大突破,见 `PARKING_NOTES.md` M9)**:
+  - `config.denoiser=conv`(`CondDenoiserConv`, ~419K 参, `train --denoiser conv`);同 12k/30k 重训全轴变好:原始无碰撞 **1.7%→32%(叠碰撞引导→70%)**、长度比 **2.34→0.95**、平均横向滑移 **0.64→0.15**(专家 0.015)。对比图 `figs/parking/m9_conv_compare.png`。
+  - **发现旧"可行率 0%"很大程度是度量 bug**:旧曲率判据在定长 N=40 弦稠密化的换档尖点处曲率爆表,**连 HA\* 专家都被判 0% 可行**。已改为对尖点免疫的**非完整性横向滑移**判据→**端到端成功率首次非零(conv+修复 6.7%)**。
+- **真正的后续**:曲率严谨可行需带 **gear/分段**信息分别算(模型不输出档位);可继续小 Transformer 去噪器 + **在 score 空间做正规 classifier guidance**。详见 `PARKING_NOTES.md` §5/M9。
 
 ---
 

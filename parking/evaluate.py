@@ -23,7 +23,7 @@ from .geometry import (denormalize_xy, cs_to_heading, cum_arclen,
                        curvature_from_poses, path_length, wrap, pose_error)
 from .vehicle import Vehicle
 from .conditioner import MapConditioner, MapEncoderCNN
-from .diffusion import make_schedule, CondDenoiser, sample
+from .diffusion import make_schedule, build_denoiser, sample
 from .map_vae import load_frozen_vae
 from .train import norm_traj4, pose3_to_norm4, CKPT, device
 from .render import render_scene
@@ -31,8 +31,10 @@ from .repair import repair_waypoints
 from .interfaces import Scenario
 
 DENSE = 200          # 稠密化点数(碰撞/曲率)
-KAPPA_TOL = 1.2      # 曲率容差倍数 (<= KAPPA_TOL / r_min)
-JUMP_TOL = 0.35      # 相邻稠密点朝向跳变上限(rad)
+KAPPA_TOL = 1.2      # 曲率容差倍数(仅诊断报告用; 定长N+弦稠密化在换档尖点会虚高, 不作可行性判据)
+SLIP_TOL = 0.2       # 非完整性(横向滑移)判据: 逐段 |sin(运动方向-航向)| 上限(~11.5°)
+MIN_MOVE = 0.05      # 逐段滑移统计时忽略小于此位移(m)的近似静止段(换档尖点)
+JUMP_TOL = 0.35      # (保留: 旧诊断量, 不再参与可行性判定)
 REPAIR_MARGIN = 1.2  # 修复时中心到障碍的安全距离(m)
 
 
@@ -40,16 +42,20 @@ REPAIR_MARGIN = 1.2  # 修复时中心到障碍的安全距离(m)
 # 轨迹稠密化 / 指标
 # --------------------------------------------------------------------------- #
 def densify_traj4(traj4, n=DENSE):
-    """(N,4)[x,y,cos,sin] -> (n,3)[x,y,theta]; x,y 与 cos,sin 分别按索引插值。"""
+    """(N,4)[x,y,cos,sin] -> (n,3)[x,y,theta]。
+
+    x,y 按索引线性插值; **航向先逐航点反 cos/sin 再沿序列 unwrap, 然后插值**。
+    (旧版直接插 cos,sin 弦: 换档尖点处两航点近反平行时弦穿过原点→arctan2 乱跳→曲率虚高,
+     连 100% 可行的 HA* 专家都会被误判为不可行。)
+    """
     t4 = np.asarray(traj4, dtype=np.float64)
     N = t4.shape[0]
     idx_old = np.arange(N)
     idx_new = np.linspace(0, N - 1, n)
     x = np.interp(idx_new, idx_old, t4[:, 0])
     y = np.interp(idx_new, idx_old, t4[:, 1])
-    c = np.interp(idx_new, idx_old, t4[:, 2])
-    s = np.interp(idx_new, idx_old, t4[:, 3])
-    th = cs_to_heading(c, s)
+    th_wp = np.unwrap(cs_to_heading(t4[:, 2], t4[:, 3]))    # 沿序列解角度环绕
+    th = np.interp(idx_new, idx_old, th_wp)                 # 直接插值连续航向
     return np.stack([x, y, th], axis=1)
 
 
@@ -61,13 +67,28 @@ def footprint_collides(grid, poses, vehicle, res):
     return False
 
 
+def nonholonomy_slip(poses, min_move=MIN_MOVE):
+    """非完整性残差(横向滑移): 逐段运动方向与车航向的垂直分量 |sin(α)|。
+    前进(平行)与倒车(反平行)都计 0; 跳过近静止段(换档尖点)。返回 (mean, max)。
+    这是定长 N 表示下**对齿轮/尖点免疫**的有效可行性代理(曲率则不然)。"""
+    poses = np.asarray(poses, dtype=np.float64)
+    dx = np.diff(poses[:, 0]); dy = np.diff(poses[:, 1]); L = np.hypot(dx, dy)
+    th = poses[:-1, 2]; c = np.cos(th); s = np.sin(th)
+    m = L > min_move
+    if not m.any():
+        return 0.0, 0.0
+    slip = np.abs((dx[m] / L[m]) * s[m] - (dy[m] / L[m]) * c[m])
+    return float(slip.mean()), float(slip.max())
+
+
 def feasibility(poses, r_min):
-    """返回 (feasible, max|kappa|, max_jump)。"""
+    """返回 (feasible, mean_slip, max|kappa|)。feasible = 横向滑移达标(max|slip|<=SLIP_TOL)。
+    kappa 仅作诊断(定长 N+弦稠密化使含尖点的真实可行路径曲率虚高, 不能当判据)。"""
+    mean_slip, max_slip = nonholonomy_slip(poses)
     kap = curvature_from_poses(poses)
     max_k = float(np.abs(kap).max())
-    jump = float(np.abs(wrap(np.diff(poses[:, 2]))).max())
-    ok = (max_k <= KAPPA_TOL / r_min) and (jump <= JUMP_TOL)
-    return ok, max_k, jump
+    ok = (max_slip <= SLIP_TOL)
+    return ok, mean_slip, max_k
 
 
 # --------------------------------------------------------------------------- #
@@ -84,8 +105,8 @@ def load_model(ckpt=CKPT, cfg=None):
     else:
         enc = MapEncoderCNN(out_dim=dc.map_emb).to(device)
     enc.load_state_dict(blob["enc"])
-    model = CondDenoiser(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
-                         hidden=dc.hidden).to(device)
+    dc.denoiser = blob.get("denoiser", "mlp")     # 旧 ckpt 无此字段 -> mlp(向后兼容)
+    model = build_denoiser(dc).to(device)
     model.load_state_dict(blob["model"])
     model.eval(); enc.eval()
     return model, enc, blob.get("bbox", (0, 0, cfg.lot.world_w, cfg.lot.world_h)), cond
@@ -136,8 +157,8 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
     res = cfg.lot.res
     n_col = n_feas = n_ok = 0
     r_col = r_feas = r_ok = 0
-    ratios = []; maxks = []; jumps = []; epos = []; eang = []
-    r_ratios = []; r_maxks = []; r_jumps = []
+    ratios = []; maxks = []; slips = []; epos = []; eang = []
+    r_ratios = []; r_maxks = []; r_slips = []
     cases = []
     for i in range(k):
         grid = maps[i, 0]
@@ -147,19 +168,19 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         # --- 原始 ---
         gposes = densify_traj4(gen4)
         col = footprint_collides(grid, gposes, veh, res)
-        feas, mk, jp = feasibility(gposes, veh.cfg.r_min)
+        feas, mslip, mk = feasibility(gposes, veh.cfg.r_min)
         glen = path_length(gposes)
         n_col += (not col); n_feas += feas; n_ok += (not col and feas)
-        ratios.append(glen / max(length[i], 1e-6)); maxks.append(mk); jumps.append(jp)
+        ratios.append(glen / max(length[i], 1e-6)); maxks.append(mk); slips.append(mslip)
         pe, ae = pose_error(gposes[-1], gp[i]); epos.append(pe); eang.append(ae)
         # --- 修复后 ---
         rep4 = repair_waypoints(gen4, grid, res, margin=REPAIR_MARGIN)
         rposes = densify_traj4(rep4)
         rcol = footprint_collides(grid, rposes, veh, res)
-        rfeas, rmk, rjp = feasibility(rposes, veh.cfg.r_min)
+        rfeas, rmslip, rmk = feasibility(rposes, veh.cfg.r_min)
         rglen = path_length(rposes)
         r_col += (not rcol); r_feas += rfeas; r_ok += (not rcol and rfeas)
-        r_ratios.append(rglen / max(length[i], 1e-6)); r_maxks.append(rmk); r_jumps.append(rjp)
+        r_ratios.append(rglen / max(length[i], 1e-6)); r_maxks.append(rmk); r_slips.append(rmslip)
         if i < n_viz:
             sc = Scenario(grid=grid, res=res, start_pose=sp[i], goal_pose=gp[i],
                           scene_type=("perp" if stype[i] == 0 else "par"), bbox=bbox)
@@ -170,9 +191,12 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         k=k, cond=cond,
         guided=float(gkw.get("scale", 0.0)) if gkw else 0.0,
         raw_collision_free=n_col / k, raw_feasible=n_feas / k, raw_success=n_ok / k,
-        raw_len_ratio=float(np.mean(ratios)), raw_max_kappa=float(np.mean(maxks)),
+        raw_len_ratio=float(np.mean(ratios)), raw_mean_slip=float(np.mean(slips)),
+        raw_max_kappa=float(np.mean(maxks)),
         rep_collision_free=r_col / k, rep_feasible=r_feas / k, rep_success=r_ok / k,
-        rep_len_ratio=float(np.mean(r_ratios)), rep_max_kappa=float(np.mean(r_maxks)),
+        rep_len_ratio=float(np.mean(r_ratios)), rep_mean_slip=float(np.mean(r_slips)),
+        rep_max_kappa=float(np.mean(r_maxks)),
+        slip_tol=SLIP_TOL,
         kappa_limit=1.0 / veh.cfg.r_min,
         mean_end_pos_err_m=float(np.mean(epos)),
         mean_end_ang_err_deg=float(np.degrees(np.mean(eang))),

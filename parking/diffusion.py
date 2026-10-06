@@ -66,6 +66,67 @@ class CondDenoiser(nn.Module):
         return self.net(h).reshape(x.shape[0], self.n_wp, self.dim)
 
 
+class _DilatedResBlock(nn.Module):
+    """时序残差块: 空洞 Conv1d(膨胀=dil) -> GELU -> 1x1 Conv, 与输入相加。"""
+
+    def __init__(self, ch, dil):
+        super().__init__()
+        self.c1 = nn.Conv1d(ch, ch, 3, padding=dil, dilation=dil)
+        self.act = nn.GELU()
+        self.c2 = nn.Conv1d(ch, ch, 1)
+
+    def forward(self, h):
+        return h + self.c2(self.act(self.c1(h)))
+
+
+class CondDenoiserConv(nn.Module):
+    """1D 时序卷积去噪器(Phase 3 升级): 对 N 个航点的**序列**做卷积, 用空洞扩张感受野。
+
+    与 CondDenoiser 接口一致: (x[B,N,dim], t, map_emb, start, goal) -> eps[B,N,dim]。
+    条件(时间/地图/起终点)经 MLP 后逐位置**广播拼接**; 额外拼接一个归一化位置通道
+    以打破卷积的平移对称(轨迹有固定的首/尾)。
+    """
+
+    def __init__(self, n_wp, dim=4, temb=64, map_emb=64,
+                 hidden=128, layers=5, cond_ch=32):
+        super().__init__()
+        self.n_wp, self.dim, self.temb = n_wp, dim, temb
+        self.cond = nn.Sequential(
+            nn.Linear(temb + map_emb + 2 * dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, cond_ch),
+        )
+        c_in = dim + cond_ch + 1                       # +1 = 位置通道
+        self.stem = nn.Conv1d(c_in, hidden, 1)
+        self.body = nn.ModuleList(
+            [_DilatedResBlock(hidden, 2 ** (i % 5)) for i in range(layers)])
+        self.head = nn.Sequential(nn.Conv1d(hidden, hidden, 1), nn.GELU(),
+                                  nn.Conv1d(hidden, dim, 1))
+        self.register_buffer("pos", torch.linspace(-1.0, 1.0, n_wp).view(1, n_wp, 1))
+
+    def forward(self, x, t, map_emb, start, goal):
+        B, N, _ = x.shape
+        cvec = self.cond(torch.cat([time_embedding(t, self.temb, x.device),
+                                    map_emb, start, goal], dim=1))      # (B,cond_ch)
+        cb = cvec[:, None, :].expand(B, N, cvec.shape[1])               # (B,N,cond_ch)
+        pb = self.pos.expand(B, N, 1)
+        h = torch.cat([x, cb, pb], dim=-1).transpose(1, 2)             # (B,c_in,N)
+        h = self.stem(h)
+        for blk in self.body:
+            h = blk(h)
+        return self.head(h).transpose(1, 2)                            # (B,N,dim)
+
+
+def build_denoiser(dc):
+    """按 config.DiffusionConfig.denoiser 选架构('mlp' 默认/'conv'), 供 train 与 evaluate 共用。"""
+    kind = getattr(dc, "denoiser", "mlp")
+    if kind == "conv":
+        return CondDenoiserConv(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
+                                hidden=dc.dconv_hidden, layers=dc.dconv_layers,
+                                cond_ch=dc.dconv_cond_ch)
+    return CondDenoiser(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
+                        hidden=dc.hidden)
+
+
 def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None):
     """反向去噪采样。每步钉住首尾位姿(含朝向)。返回 (B,N,4) 归一化轨迹。
 
