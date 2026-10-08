@@ -157,7 +157,8 @@ def load_model(ckpt=CKPT, cfg=None):
     cond = blob.get("cond", "lat")
     if cond == "lat":
         vae = load_frozen_vae(lat_ch=dc.lat_ch)
-        enc = MapConditioner(vae, out_dim=dc.map_emb, lat_hw=(9, 16)).to(device)
+        use_sdf = blob.get("map_cond", "lat_sdf") == "lat_sdf"   # 旧 ckpt 无此字段 -> lat_sdf(向后兼容)
+        enc = MapConditioner(vae, out_dim=dc.map_emb, lat_hw=(9, 16), use_sdf=use_sdf).to(device)
     else:
         enc = MapEncoderCNN(out_dim=dc.map_emb).to(device)
     enc.load_state_dict(blob["enc"])

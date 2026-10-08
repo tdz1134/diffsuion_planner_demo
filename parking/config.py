@@ -129,9 +129,17 @@ class DiffusionConfig:
     cond: str = "lat"            # lat=冻结VAE latent+SDF; cnn=纯CNN基线
     # 去噪器架构(Phase 3 升级): mlp=旧的全连接(默认, 向后兼容); conv=1D 时序空洞卷积(对相邻航点的局部运动学耦合有归纳偏置)
     denoiser: str = "mlp"
+    # 地图条件构成(仅 cond=lat 时有意义): lat_sdf=VAE latent⊕SDF双分支(默认, 向后兼容); vae=只用冻结VAE latent(去掉SDF分支)
+    map_cond: str = "lat_sdf"
     dconv_hidden: int = 128      # conv 去噪器主干通道数
     dconv_layers: int = 5        # conv 残差块数(空洞膨胀 1,2,4,8,16 覆盖整条 N=40)
     dconv_cond_ch: int = 32      # 条件(时间/地图/起终点)经 MLP 后逐位置广播的通道数
+    # Transformer 去噪器(Phase 5): 对 N 个航点做全局时序自注意力(相对 conv 的局部感受野)
+    dtrans_model: int = 128      # 注意力隐藏维
+    dtrans_heads: int = 4        # 多头注意力头数
+    dtrans_layers: int = 4       # Encoder 层数
+    dtrans_ff: int = 256         # 前馈内层维
+    dtrans_dropout: float = 0.1
     # Phase 2: 轨迹空间辅助惩罚(作用于去噪得到的 x0_hat; 权重 0=关闭, 向后兼容)
     w_nh: float = 0.0            # 航向一致性(非完整约束, 允许前进/倒车, 惩罚侧滑)
     w_curv: float = 0.0          # 曲率超限 |kappa|>1/r_min 惩罚

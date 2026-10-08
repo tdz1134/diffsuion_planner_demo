@@ -102,11 +102,14 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
 # 主入口
 # --------------------------------------------------------------------------- #
 def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKPT,
-         w_nh=None, w_curv=None, w_coll=None, coll_margin=None, denoiser=None, n_wp=None):
+         w_nh=None, w_curv=None, w_coll=None, coll_margin=None, denoiser=None, n_wp=None,
+         map_cond=None):
     cfg = default_config()
     dc = cfg.diffusion
     if denoiser is not None:
         dc.denoiser = denoiser
+    if map_cond is not None:
+        dc.map_cond = map_cond
     if w_nh is not None:
         dc.w_nh = w_nh
     if w_curv is not None:
@@ -138,11 +141,14 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
 
     lat = None
     if cond == "lat":
+        use_sdf = getattr(dc, "map_cond", "lat_sdf") == "lat_sdf"
         vae = load_frozen_vae(lat_ch=dc.lat_ch)
         enc = MapConditioner(vae, out_dim=dc.map_emb,
-                             lat_hw=(maps.shape[2] // 8, maps.shape[3] // 8)).to(device)
+                             lat_hw=(maps.shape[2] // 8, maps.shape[3] // 8),
+                             use_sdf=use_sdf).to(device)
         lat = precompute_latents(enc.vae, maps)
-        print("[cond] frozen-VAE latent + SDF; precomputed lat %s" % (tuple(lat.shape),))
+        print("[cond] frozen-VAE %s; precomputed lat %s"
+              % ("latent+SDF" if use_sdf else "latent-only(vae)", tuple(lat.shape)))
     else:
         enc = MapEncoderCNN(out_dim=dc.map_emb).to(device)
         print("[cond] CNN baseline")
@@ -167,7 +173,7 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
     os.makedirs(os.path.dirname(out), exist_ok=True)
     torch.save({"model": model.state_dict(), "enc": enc.state_dict(),
                 "cond": cond, "n_wp": dc.n_wp, "bbox": bbox,
-                "denoiser": dc.denoiser}, out)
+                "denoiser": dc.denoiser, "map_cond": dc.map_cond}, out)
     print("[saved] %s" % out)
 
     if quick:   # 冒烟: 采样少量, 校验端点钉住
@@ -193,11 +199,13 @@ if __name__ == "__main__":
     ap.add_argument("--w-curv", type=float, default=None, help="Phase2 曲率超限损失权重(0=关)")
     ap.add_argument("--w-coll", type=float, default=None, help="Phase2 足迹碰撞损失权重(0=关)")
     ap.add_argument("--coll-margin", type=float, default=None, help="足迹碰撞安全间隙(m)")
-    ap.add_argument("--denoiser", choices=["mlp", "conv"], default=None,
-                    help="去噪器架构(Phase3): conv=1D 时序卷积; 缺省用 config(mlp)")
+    ap.add_argument("--denoiser", choices=["mlp", "conv", "trans"], default=None,
+                    help="去噪器架构: conv=1D 时序卷积, trans=Transformer; 缺省用 config(mlp)")
+    ap.add_argument("--map-cond", choices=["lat_sdf", "vae"], default=None,
+                    help="地图条件(cond=lat): lat_sdf=VAE latent⊕SDF(默认), vae=只用 VAE latent")
     ap.add_argument("--n-wp", type=int, default=None,
                     help="定长航点数 N; 缺省自动从数据 traj 推导(向后兼容)")
     a = ap.parse_args()
     main(a.npz, a.steps, a.batch, a.cond, a.quick, a.out,
          w_nh=a.w_nh, w_curv=a.w_curv, w_coll=a.w_coll, coll_margin=a.coll_margin,
-         denoiser=a.denoiser, n_wp=a.n_wp)
+         denoiser=a.denoiser, n_wp=a.n_wp, map_cond=a.map_cond)

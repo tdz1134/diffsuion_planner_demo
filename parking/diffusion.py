@@ -116,13 +116,51 @@ class CondDenoiserConv(nn.Module):
         return self.head(h).transpose(1, 2)                            # (B,N,dim)
 
 
+class CondDenoiserTransformer(nn.Module):
+    """Transformer 去噪器(Phase 5): 把 N 个航点当序列做**全局时序自注意力**。
+
+    与 CondDenoiser/Conv 接口一致: (x[B,N,dim], t, map_emb, start, goal) -> eps[B,N,dim]。
+    条件(时间/地图/起终点)压成**一个前缀 token** 拼在序列头部(类 class-token), N 个航点 token
+    过 Encoder 后取回各自位置输出。相对 conv(局部空洞感受野)能直接建模跨全程的依赖。
+    """
+
+    def __init__(self, n_wp, dim=4, temb=64, map_emb=64,
+                 model=128, heads=4, layers=4, ff=256, dropout=0.1):
+        super().__init__()
+        self.n_wp, self.dim, self.temb = n_wp, dim, temb
+        self.proj = nn.Linear(dim, model)
+        self.pos = nn.Parameter(torch.zeros(1, n_wp, model))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.condtok = nn.Linear(temb + map_emb + 2 * dim, model)   # 1 个条件 token
+        self.pre = nn.LayerNorm(model)
+        layer = nn.TransformerEncoderLayer(model, heads, ff, dropout,
+                                           batch_first=True, activation="gelu")
+        self.enc = nn.TransformerEncoder(layer, layers)
+        self.norm = nn.LayerNorm(model)
+        self.head = nn.Linear(model, dim)
+
+    def forward(self, x, t, map_emb, start, goal):
+        B, N, _ = x.shape
+        h = self.proj(x) + self.pos                                    # (B,N,model)
+        c = self.condtok(torch.cat([time_embedding(t, self.temb, x.device),
+                                    map_emb, start, goal], dim=1))     # (B,model)
+        seq = self.pre(torch.cat([c[:, None, :], h], dim=1))           # (B,N+1,model)
+        o = self.norm(self.enc(seq))[:, 1:]                            # 去掉条件 token
+        return self.head(o)                                            # (B,N,dim)
+
+
 def build_denoiser(dc):
-    """按 config.DiffusionConfig.denoiser 选架构('mlp' 默认/'conv'), 供 train 与 evaluate 共用。"""
+    """按 config.DiffusionConfig.denoiser 选架构('mlp' 默认/'conv'/'trans'), 供 train 与 evaluate 共用。"""
     kind = getattr(dc, "denoiser", "mlp")
     if kind == "conv":
         return CondDenoiserConv(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
                                 hidden=dc.dconv_hidden, layers=dc.dconv_layers,
                                 cond_ch=dc.dconv_cond_ch)
+    if kind == "trans":
+        return CondDenoiserTransformer(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
+                                       model=dc.dtrans_model, heads=dc.dtrans_heads,
+                                       layers=dc.dtrans_layers, ff=dc.dtrans_ff,
+                                       dropout=dc.dtrans_dropout)
     return CondDenoiser(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
                         hidden=dc.hidden)
 

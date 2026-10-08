@@ -41,20 +41,29 @@ class SdfEnc(nn.Module):
 
 
 class MapConditioner(nn.Module, MapConditionerABC):
-    """冻结 VAE latent + SDF 双分支 -> map_emb。"""
+    """冻结 VAE latent (+可选 SDF) -> map_emb。
 
-    def __init__(self, vae, out_dim=64, lat_hw=(9, 16)):
+    use_sdf=True(默认): VAE latent→out/2 ⊕ SDF→out/2 = out(向后兼容旧 ckpt)。
+    use_sdf=False(vae-only): 只用 VAE latent → out。
+    """
+
+    def __init__(self, vae, out_dim=64, lat_hw=(9, 16), use_sdf=True):
         super().__init__()
         self.vae = vae                                   # 冻结子模块
+        self.use_sdf = use_sdf
         lat_dim = vae.enc.mu.out_channels * int(lat_hw[0]) * int(lat_hw[1])
-        self.lat_enc = LatentEnc(lat_dim, out_dim // 2)
-        self.sdf_enc = SdfEnc(out_dim // 2)
+        lat_out = out_dim // 2 if use_sdf else out_dim
+        self.lat_enc = LatentEnc(lat_dim, lat_out)
+        if use_sdf:
+            self.sdf_enc = SdfEnc(out_dim // 2)
 
     def forward(self, m, z=None):
-        sdf = m[:, 1:2]
         if z is None:
             with torch.no_grad():
                 z = self.vae.encode(m[:, 0:1])
+        if not self.use_sdf:
+            return self.lat_enc(z)
+        sdf = m[:, 1:2]
         return torch.cat([self.lat_enc(z), self.sdf_enc(sdf)], dim=1)
 
 
