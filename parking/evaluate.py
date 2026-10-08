@@ -147,6 +147,43 @@ def feasibility(poses, r_min):
     return ok, mean_slip, seg_k, nseg
 
 
+def gear_to_dense(gear, n=DENSE):
+    """把 N 个航点的档位序列最近邻上采样到稠密位姿长度 n。"""
+    g = np.asarray(gear)
+    idx = np.round(np.linspace(0, g.shape[0] - 1, n)).astype(int)
+    return g[idx]
+
+
+def gear_segment_indices(gear_dense):
+    """按档位符号翻转把序列切成前向/倒车子段(索引区间 [i,j])。近 0 视为沿用前一段。"""
+    n = len(gear_dense)
+    if n < 2:
+        return [(0, n)]
+    segs = []; start = 0; cur = np.sign(gear_dense[0])
+    for i in range(1, n):
+        s = np.sign(gear_dense[i])
+        if s != 0 and s != cur:
+            segs.append((start, i)); start = i; cur = s
+    segs.append((start, n))
+    return segs
+
+
+def gear_curv_worst(poses, gear_dense, step=CURV_STEP):
+    """M15: 按**真实/预测档位**分段(非尖点启发式), 每段重采样后取最大 |κ|(位置 Menger)。
+    返回 (worst_kappa, n_seg, switches)。有了 gear 就能把换档尖点正确切开, 使曲率**可作绝对硬门**。"""
+    poses = np.asarray(poses, dtype=np.float64)
+    worst = 0.0; nseg = 0
+    sw = int(np.sum(np.abs(np.diff(np.sign(gear_dense))) > 0))
+    for i, j in gear_segment_indices(gear_dense):
+        seg = poses[i:j]
+        if seg.shape[0] < 2 or float(cum_arclen(seg[:, :2])[-1]) < MIN_SEG_LEN:
+            continue
+        nseg += 1
+        m = max(3, int(np.ceil(cum_arclen(seg[:, :2])[-1] / step)) + 1)
+        worst = max(worst, _menger_max(resample_poses(seg, m)[:, :2]))
+    return worst, nseg, sw
+
+
 # --------------------------------------------------------------------------- #
 # 主评估
 # --------------------------------------------------------------------------- #
@@ -164,6 +201,7 @@ def load_model(ckpt=CKPT, cfg=None):
     enc.load_state_dict(blob["enc"])
     dc.denoiser = blob.get("denoiser", "mlp")     # 旧 ckpt 无此字段 -> mlp(向后兼容)
     dc.n_wp = int(blob.get("n_wp", dc.n_wp))       # N 随 ckpt(旧 40/缺省 40, N=80 自动 80)
+    dc.use_gear = bool(blob.get("use_gear", False))  # M15: 旧 ckpt 无此字段 -> False(向后兼容)
     model = build_denoiser(dc).to(device)
     model.load_state_dict(blob["model"])
     model.eval(); enc.eval()
@@ -229,20 +267,34 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
                    critic=critic, critic_scale=c_scale, critic_min_abar=c_minabar).cpu().numpy()   # (k,N,4) norm
 
     res = cfg.lot.res
+    rmin = veh.cfg.r_min
+    kcurv_lim = KAPPA_TOL / rmin                 # 档位感知曲率硬门(有了 gear 才能用)
     n_col = n_feas = n_ok = 0
     r_col = r_feas = r_ok = 0
     ratios = []; maxks = []; slips = []; nsegs = []; epos = []; eang = []
     r_ratios = []; r_maxks = []; r_slips = []; r_nsegs = []
+    n_gcurv_ok = n_expgcurv_ok = 0; gaccs = []; pswitches = []
     cases = []
     for i in range(k):
         grid = maps[i, 0]
-        # 生成: 归一化 -> 世界
-        gen4 = gen_n[i].copy()
+        # 生成: 归一化 -> 世界 (use_gear 时列 4 为预测档位)
+        gene = gen_n[i].copy()
+        gen4 = gene[:, :4].copy()
+        pgear = gene[:, 4] if gene.shape[1] > 4 else None
         gen4[:, :2] = denormalize_xy(gen4[:, :2], *bbox)
         # --- 原始 ---
         gposes = densify_traj4(gen4)
         col = footprint_collides(grid, gposes, veh, res)
         feas, mslip, mk, nseg = feasibility(gposes, veh.cfg.r_min)
+        if pgear is not None:                        # M15: 按预测档位的曲率可行 + 专家自检
+            gd = gear_to_dense(np.sign(pgear))
+            wk, _, wsw = gear_curv_worst(gposes, gd)
+            n_gcurv_ok += (wk <= kcurv_lim); pswitches.append(wsw)
+            gtg = np.sign(gear[i])
+            msk = (gtg != 0)
+            gaccs.append(float(((np.sign(pgear) == gtg) & msk).sum()) / max(int(msk.sum()), 1))
+            ex = densify_traj4(traj[i]); exg = gear_to_dense(gtg)
+            n_expgcurv_ok += (gear_curv_worst(ex, exg)[0] <= kcurv_lim)
         glen = path_length(gposes)
         n_col += (not col); n_feas += feas; n_ok += (not col and feas)
         ratios.append(glen / max(length[i], 1e-6)); maxks.append(mk); slips.append(mslip); nsegs.append(nseg)
@@ -273,6 +325,10 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         rep_seg_kappa=float(np.mean(r_maxks)), rep_gear_switches=float(np.mean(r_nsegs)),
         slip_tol=SLIP_TOL,
         kappa_limit=1.0 / veh.cfg.r_min,
+        gear_curv_feasible=(n_gcurv_ok / k if gaccs else None),
+        expert_gear_curv_feasible=(n_expgcurv_ok / k if gaccs else None),
+        gear_acc=(float(np.mean(gaccs)) if gaccs else None),
+        pred_gear_switches=(float(np.mean(pswitches)) if pswitches else None),
         mean_end_pos_err_m=float(np.mean(epos)),
         mean_end_ang_err_deg=float(np.degrees(np.mean(eang))),
     )

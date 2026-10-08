@@ -103,13 +103,15 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
 # --------------------------------------------------------------------------- #
 def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKPT,
          w_nh=None, w_curv=None, w_coll=None, coll_margin=None, denoiser=None, n_wp=None,
-         map_cond=None):
+         map_cond=None, use_gear=None):
     cfg = default_config()
     dc = cfg.diffusion
     if denoiser is not None:
         dc.denoiser = denoiser
     if map_cond is not None:
         dc.map_cond = map_cond
+    if use_gear is not None:
+        dc.use_gear = use_gear
     if w_nh is not None:
         dc.w_nh = w_nh
     if w_curv is not None:
@@ -134,6 +136,9 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
     tr_mask = d["split"] == 0
     maps = torch.tensor(d["maps"][tr_mask], device=device)
     x0 = torch.tensor(norm_traj4(d["traj"][tr_mask], bbox), device=device)
+    if dc.use_gear:                                   # M15: 档位作为额外一个扩散输出通道(已∈[-1,1], 不再归一)
+        gch = torch.tensor(d["gear"][tr_mask], dtype=torch.float32, device=device)[:, :, None]
+        x0 = torch.cat([x0, gch], dim=-1)             # (N,4)->(N,5)
     s4 = torch.tensor(pose3_to_norm4(d["start_pose"][tr_mask], bbox), device=device)
     g4 = torch.tensor(pose3_to_norm4(d["goal_pose"][tr_mask], bbox), device=device)
     print("[info] device=%s npz=%s train=%d x0=%s" % (device, npz_path,
@@ -173,7 +178,8 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
     os.makedirs(os.path.dirname(out), exist_ok=True)
     torch.save({"model": model.state_dict(), "enc": enc.state_dict(),
                 "cond": cond, "n_wp": dc.n_wp, "bbox": bbox,
-                "denoiser": dc.denoiser, "map_cond": dc.map_cond}, out)
+                "denoiser": dc.denoiser, "map_cond": dc.map_cond,
+                "use_gear": bool(dc.use_gear)}, out)
     print("[saved] %s" % out)
 
     if quick:   # 冒烟: 采样少量, 校验端点钉住
@@ -203,9 +209,11 @@ if __name__ == "__main__":
                     help="去噪器架构: conv=1D 时序卷积, trans=旧 Transformer(单前缀token), trans2=忠实版(cross-attn+AdaLN); 缺省用 config(mlp)")
     ap.add_argument("--map-cond", choices=["lat_sdf", "vae"], default=None,
                     help="地图条件(cond=lat): lat_sdf=VAE latent⊕SDF(默认), vae=只用 VAE latent")
+    ap.add_argument("--use-gear", action="store_true",
+                    help="M15: 把档位 gear 作为额外的扩散输出通道(state dim 4->5)")
     ap.add_argument("--n-wp", type=int, default=None,
                     help="定长航点数 N; 缺省自动从数据 traj 推导(向后兼容)")
     a = ap.parse_args()
     main(a.npz, a.steps, a.batch, a.cond, a.quick, a.out,
          w_nh=a.w_nh, w_curv=a.w_curv, w_coll=a.w_coll, coll_margin=a.coll_margin,
-         denoiser=a.denoiser, n_wp=a.n_wp, map_cond=a.map_cond)
+         denoiser=a.denoiser, n_wp=a.n_wp, map_cond=a.map_cond, use_gear=a.use_gear or None)

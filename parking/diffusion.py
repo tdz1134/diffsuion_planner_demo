@@ -46,12 +46,13 @@ def time_embedding(t, dim, device):
 class CondDenoiser(nn.Module):
     """输入 (x_t[N*4], t, map_emb, start4, goal4) -> 预测噪声 (N,4)。"""
 
-    def __init__(self, n_wp, dim=4, temb=64, map_emb=64, hidden=512):
+    def __init__(self, n_wp, dim=4, temb=64, map_emb=64, hidden=512, pose_dim=None):
         super().__init__()
         self.n_wp = n_wp
         self.dim = dim
+        self.pose_dim = dim if pose_dim is None else pose_dim
         self.temb = temb
-        in_dim = n_wp * dim + temb + map_emb + dim + dim
+        in_dim = n_wp * dim + temb + map_emb + 2 * self.pose_dim
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
@@ -88,11 +89,12 @@ class CondDenoiserConv(nn.Module):
     """
 
     def __init__(self, n_wp, dim=4, temb=64, map_emb=64,
-                 hidden=128, layers=5, cond_ch=32):
+                 hidden=128, layers=5, cond_ch=32, pose_dim=None):
         super().__init__()
         self.n_wp, self.dim, self.temb = n_wp, dim, temb
+        self.pose_dim = dim if pose_dim is None else pose_dim
         self.cond = nn.Sequential(
-            nn.Linear(temb + map_emb + 2 * dim, hidden), nn.ReLU(),
+            nn.Linear(temb + map_emb + 2 * self.pose_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, cond_ch),
         )
         c_in = dim + cond_ch + 1                       # +1 = 位置通道
@@ -125,13 +127,14 @@ class CondDenoiserTransformer(nn.Module):
     """
 
     def __init__(self, n_wp, dim=4, temb=64, map_emb=64,
-                 model=128, heads=4, layers=4, ff=256, dropout=0.1):
+                 model=128, heads=4, layers=4, ff=256, dropout=0.1, pose_dim=None):
         super().__init__()
         self.n_wp, self.dim, self.temb = n_wp, dim, temb
+        self.pose_dim = dim if pose_dim is None else pose_dim
         self.proj = nn.Linear(dim, model)
         self.pos = nn.Parameter(torch.zeros(1, n_wp, model))
         nn.init.trunc_normal_(self.pos, std=0.02)
-        self.condtok = nn.Linear(temb + map_emb + 2 * dim, model)   # 1 个条件 token
+        self.condtok = nn.Linear(temb + map_emb + 2 * self.pose_dim, model)   # 1 个条件 token
         self.pre = nn.LayerNorm(model)
         layer = nn.TransformerEncoderLayer(model, heads, ff, dropout,
                                            batch_first=True, activation="gelu")
@@ -183,13 +186,14 @@ class CondDenoiserTransformer2(nn.Module):
     """
 
     def __init__(self, n_wp, dim=4, temb=64, map_emb=64, model=128, heads=4,
-                 layers=4, ff=256, dropout=0.1, cond_tokens=8):
+                 layers=4, ff=256, dropout=0.1, cond_tokens=8, pose_dim=None):
         super().__init__()
         self.n_wp, self.dim, self.temb = n_wp, dim, temb
+        self.pose_dim = dim if pose_dim is None else pose_dim
         self.proj = nn.Linear(dim, model)
         self.pos = nn.Parameter(torch.zeros(1, n_wp, model))
         nn.init.trunc_normal_(self.pos, std=0.02)
-        cond_dim = map_emb + 2 * dim                     # map_emb ⊕ start ⊕ goal → cross-attn memory
+        cond_dim = map_emb + 2 * self.pose_dim             # map_emb ⊕ start ⊕ goal(pose_dim) → cross-attn memory
         self.mem = nn.Sequential(nn.Linear(cond_dim, model), nn.GELU(),
                                  nn.Linear(model, cond_tokens * model))
         self.cond_tokens = cond_tokens
@@ -213,25 +217,31 @@ class CondDenoiserTransformer2(nn.Module):
 
 
 def build_denoiser(dc):
-    """按 config.DiffusionConfig.denoiser 选架构('mlp' 默认/'conv'/'trans'/'trans2'), 供 train 与 evaluate 共用。"""
+    """按 config.DiffusionConfig.denoiser 选架构('mlp'/'conv'/'trans'/'trans2'), 供 train 与 evaluate 共用。
+
+    去耦两个维度: 状态输出通道 dim = SE(2)的4 (+1 若 use_gear 拼接档位); 条件里的 start/goal 始终用 pose_dim=4。
+    默认 use_gear=False → dim==pose_dim==4, 与旧 ckpt/管道完全一致。
+    """
     kind = getattr(dc, "denoiser", "mlp")
+    pose_dim = int(dc.dim)
+    sd = pose_dim + (1 if getattr(dc, "use_gear", False) else 0)   # state 输出通道数
     if kind == "conv":
-        return CondDenoiserConv(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
+        return CondDenoiserConv(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
                                 hidden=dc.dconv_hidden, layers=dc.dconv_layers,
-                                cond_ch=dc.dconv_cond_ch)
+                                cond_ch=dc.dconv_cond_ch, pose_dim=pose_dim)
     if kind == "trans":
-        return CondDenoiserTransformer(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
+        return CondDenoiserTransformer(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
                                        model=dc.dtrans_model, heads=dc.dtrans_heads,
                                        layers=dc.dtrans_layers, ff=dc.dtrans_ff,
-                                       dropout=dc.dtrans_dropout)
+                                       dropout=dc.dtrans_dropout, pose_dim=pose_dim)
     if kind == "trans2":
-        return CondDenoiserTransformer2(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
+        return CondDenoiserTransformer2(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
                                         model=dc.dtrans_model, heads=dc.dtrans_heads,
                                         layers=dc.dtrans_layers, ff=dc.dtrans_ff,
                                         dropout=dc.dtrans_dropout,
-                                        cond_tokens=dc.dtrans_cond_tokens)
-    return CondDenoiser(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
-                        hidden=dc.hidden)
+                                        cond_tokens=dc.dtrans_cond_tokens, pose_dim=pose_dim)
+    return CondDenoiser(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
+                        hidden=dc.hidden, pose_dim=pose_dim)
 
 
 def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None,
@@ -254,8 +264,9 @@ def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None,
         map_emb = enc(maps, z=z) if z is not None else enc(maps)
     T = sch["T"]
     x = torch.randn(B, model.n_wp, model.dim, device=maps.device)
+    pdim = starts4.shape[-1]                              # pose 通道数(4); use_gear 时 x 多一列档位不钉
     if pin:
-        x[:, 0] = starts4; x[:, -1] = goals4
+        x[:, 0, :pdim] = starts4; x[:, -1, :pdim] = goals4
     if guide is not None:
         sdf_m = maps[:, 1:2] * guide["sdf_clip"]
         inv_rmin = 1.0 / guide["veh"].r_min
@@ -286,5 +297,5 @@ def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None,
         else:
             x = mean
         if pin:
-            x[:, 0] = starts4; x[:, -1] = goals4
+            x[:, 0, :pdim] = starts4; x[:, -1, :pdim] = goals4
     return x

@@ -129,6 +129,11 @@ class DiffusionConfig:
     cond: str = "lat"            # lat=冻结VAE latent+SDF; cnn=纯CNN基线
     # 去噪器架构(Phase 3 升级): mlp=旧的全连接(默认, 向后兼容); conv=1D 时序空洞卷积(对相邻航点的局部运动学耦合有归纳偏置)
     denoiser: str = "mlp"
+    # Phase 5 (M15): 把档位 gear 作为额外一个扩散输出通道(state dim=dim+1, 前向+1/倒车-1)。默认关=旧 SE(2)4通道管道不变。
+    use_gear: bool = False
+    # Phase 5 (M16): x0-空间可行性损失(施加在 x0_hat、仅晚步高 abar 时), 默认 0=关(避开 M8 发散)
+    w_smooth: float = 0.0        # 一/二阶时序差分平滑(治航点抖动)
+    w_curv_x0: float = 0.0       # 速度自适应曲率惩罚 κ_max(v)=min(κ_geo, a_lat/v²)
     # 地图条件构成(仅 cond=lat 时有意义): lat_sdf=VAE latent⊕SDF双分支(默认, 向后兼容); vae=只用冻结VAE latent(去掉SDF分支)
     map_cond: str = "lat_sdf"
     dconv_hidden: int = 128      # conv 去噪器主干通道数
