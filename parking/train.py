@@ -199,8 +199,8 @@ if __name__ == "__main__":
     ap.add_argument("--w-curv", type=float, default=None, help="Phase2 曲率超限损失权重(0=关)")
     ap.add_argument("--w-coll", type=float, default=None, help="Phase2 足迹碰撞损失权重(0=关)")
     ap.add_argument("--coll-margin", type=float, default=None, help="足迹碰撞安全间隙(m)")
-    ap.add_argument("--denoiser", choices=["mlp", "conv", "trans"], default=None,
-                    help="去噪器架构: conv=1D 时序卷积, trans=Transformer; 缺省用 config(mlp)")
+    ap.add_argument("--denoiser", choices=["mlp", "conv", "trans", "trans2"], default=None,
+                    help="去噪器架构: conv=1D 时序卷积, trans=旧 Transformer(单前缀token), trans2=忠实版(cross-attn+AdaLN); 缺省用 config(mlp)")
     ap.add_argument("--map-cond", choices=["lat_sdf", "vae"], default=None,
                     help="地图条件(cond=lat): lat_sdf=VAE latent⊕SDF(默认), vae=只用 VAE latent")
     ap.add_argument("--n-wp", type=int, default=None,

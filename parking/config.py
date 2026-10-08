@@ -140,6 +140,7 @@ class DiffusionConfig:
     dtrans_layers: int = 4       # Encoder 层数
     dtrans_ff: int = 256         # 前馈内层维
     dtrans_dropout: float = 0.1
+    dtrans_cond_tokens: int = 8  # trans2: 条件(地图/起终点)展开成多少个 memory token 供每层 cross-attn 读
     # Phase 2: 轨迹空间辅助惩罚(作用于去噪得到的 x0_hat; 权重 0=关闭, 向后兼容)
     w_nh: float = 0.0            # 航向一致性(非完整约束, 允许前进/倒车, 惩罚侧滑)
     w_curv: float = 0.0          # 曲率超限 |kappa|>1/r_min 惩罚

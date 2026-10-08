@@ -233,7 +233,8 @@ venv_py38/bin/python -m parking.evaluate --npz cache/parking_4000.npz # ④ 评�
 - **M11 提高 N:40→80(用户选定)— 修好了度量, 没修好模型**: N 参数化(train/evaluate **自动从数据/ckpt 推 N**, 向后兼容)。同场景重生 N=80 数据+重训 conv: **专家分段曲率 1.45→0.43、达上限占比 43%→78%**→曲率终于**可测**; 但 **conv@N80 仍 κ≈4.6(0%可行)、原始碰撞 0.32→0.18**→**瓶颈在模型/目标而非表示**。价值: 现在可在 N=80 上用正规 classifier guidance/曲率惩罚去约束模型。对比图 `figs/parking/m11_n80_compare.png`。
 - **M12 正规 classifier guidance(用户选定)— 诚实负结果**: 训了可行性判别器 `parking/critic.py`(噪声增强、对 x_t 取梯度, 标准姿势), 它能完美分开专家/模型采样(acc 1.0)。**但引导仍发散**——scale=0.02、只晚步也 len_ratio 0.95→3~19、碰撞归零, 与 M8 手写几何代价同根病。**推理期事后引导(几何 or 学习判别器)对本 DDPM 均病态: 梯度把样本推向离流形对抗区。→ 可行性必须训时内化到模型(gear-aware 架构/建模), 不能事后贴。** 代码保留、默认关(c-scale=0 不影响基线)。
 - **M13 用户两项改动(map 条件简化为纯 VAE + 上 Transformer)— 诚实负结果**: 两个开关均**可切换、默认不变**(向后兼容)。**(A) map_cond=vae**(去 SDF): conv 上隔离→无碰撞率 **0.233→0.133**、端到端 **0.083→0.017**(变差——SDF 是降碰撞的承重分支)。**(B) denoiser=trans**(全局时序自注意力): lat_sdf 上隔离→无碰撞持平 0.200, 但**滑移 0.195→0.376、换挡抖动 2.28→5.80 回潮**(逼近 MLP)。两者均不优于 conv@N80 → **再次确认瓶颈在目标/表示(无 gear 监督), 不在条件构成或感受野**。代码+3 个 ckpt 作消融产物保留, 默认 mlp+lat_sdf 未动。图 `figs/parking/m13_*.png`。
-- **真正的后续(已排除事后引导)**: 下一步方向 = **让去噪器输出 gear / 混合(gear-aware)表示或架构**, 把运动学可行性训时内化。详见 `PARKING_NOTES.md` §5/M9–M13。
+- **M14 忠实 Transformer 重测(trans2: 每层 cross-attn 读条件 + AdaLN-Zero)— 正向结果, 修正 M13B**: M13B 的 trans 把条件压成单前缀 token(非论文写法)。新增 `denoiser="trans2"`(`CondDenoiserTransformer2`, 旧 trans 保留可加载), 按 Diffusion Policy-T / Diffusion Planner 做法: 航点自注意力 + 对条件 memory 每层 cross-attention + AdaLN-Zero 注入时间步。同 N80+lat_sdf 公平训→**滑移 0.195→0.113、分段κ 5.23→3.44、修复后无碰撞 0.30→0.383、端到端 0.083→0.10、gear 抖动 2.65≈专家**(均优于 conv)→**之前“Transformer 无用”是实现不对的假象**。但绝对曲率硬门仍0%可行→架构只治标, M15(gear输出+x0可行性损失)仍是下一步。ckpt `parking/cache/diffusion_parking_trans2_n80.pt`。图 `figs/parking/m14_trans2_n80.png`。
+- **真正的后续(已排除事后引导)**: 下一步方向 = **让去噪器输出 gear / 混合(gear-aware)表示或架构**, 把运动学可行性训时内化。详见 `PARKING_NOTES.md` §5/M9–M15。
 
 ---
 

@@ -149,8 +149,71 @@ class CondDenoiserTransformer(nn.Module):
         return self.head(o)                                            # (B,N,dim)
 
 
+class _CondBlock(nn.Module):
+    """DiT 风格条件块: 航点自注意力 + 对条件 memory 的 cross-attention + FFN,
+    时间步/条件通过 AdaLN-Zero(shift/scale/gate)注入(与 Diffusion Policy-T / Diffusion Planner 一致)。"""
+
+    def __init__(self, model, heads, ff, dropout):
+        super().__init__()
+        self.n_self = nn.LayerNorm(model, elementwise_affine=False)
+        self.self_attn = nn.MultiheadAttention(model, heads, dropout=dropout, batch_first=True)
+        self.n_cross = nn.LayerNorm(model, elementwise_affine=True)
+        self.cross_attn = nn.MultiheadAttention(model, heads, dropout=dropout, batch_first=True)
+        self.n_ff = nn.LayerNorm(model, elementwise_affine=False)
+        self.ff = nn.Sequential(nn.Linear(model, ff), nn.GELU(), nn.Linear(ff, model))
+        self.ada = nn.Linear(model, 6 * model)          # 由共享条件嵌入→ 3子层×(shift,scale,gate)
+
+    def forward(self, h, mem, mod):
+        # h:(B,N,model); mod:(B,model) → 逐块调制参数需 reshape 成 (B,1,model) 才能在 N 个航点上广播
+        sm1, sc1, g1, sm2, sc2, g2 = self.ada(mod).chunk(6, dim=-1)
+        sm1, sc1, g1, sm2, sc2, g2 = [v[:, None, :] for v in (sm1, sc1, g1, sm2, sc2, g2)]
+        hs = self.n_self(h) * (1 + sc1) + sm1
+        h = h + g1 * self.self_attn(hs, hs, hs, need_weights=False)[0]      # 航点间自注意力
+        h = h + self.cross_attn(self.n_cross(h), mem, mem, need_weights=False)[0]  # 读地图/起终点条件
+        hf = self.n_ff(h) * (1 + sc2) + sm2
+        h = h + g2 * self.ff(hf)
+        return h
+
+
+class CondDenoiserTransformer2(nn.Module):
+    """忠实版条件 Transformer 去噪器(M14): 每层 cross-attention 读条件 memory + AdaLN-Zero 注入时间步。
+
+    与 trans(单前缀 token)的弱点相比, 这是 Diffusion Policy-T / Diffusion Planner(ICLR25)采用、能真正
+    建模多模态轨迹的写法, 作为对 Transformer 的公平重测。接口不变: (x,t,map_emb,start,goal)->eps(B,N,dim)。
+    """
+
+    def __init__(self, n_wp, dim=4, temb=64, map_emb=64, model=128, heads=4,
+                 layers=4, ff=256, dropout=0.1, cond_tokens=8):
+        super().__init__()
+        self.n_wp, self.dim, self.temb = n_wp, dim, temb
+        self.proj = nn.Linear(dim, model)
+        self.pos = nn.Parameter(torch.zeros(1, n_wp, model))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        cond_dim = map_emb + 2 * dim                     # map_emb ⊕ start ⊕ goal → cross-attn memory
+        self.mem = nn.Sequential(nn.Linear(cond_dim, model), nn.GELU(),
+                                 nn.Linear(model, cond_tokens * model))
+        self.cond_tokens = cond_tokens
+        self.tmod = nn.Sequential(nn.Linear(temb, model), nn.SiLU(), nn.Linear(model, model))
+        self.blocks = nn.ModuleList([_CondBlock(model, heads, ff, dropout) for _ in range(layers)])
+        self.final = nn.LayerNorm(model, elementwise_affine=False)
+        self.head = nn.Linear(model, dim)
+        # AdaLN-Zero: gate 初始化 0, 训练更稳(DiT)
+        for b in self.blocks:
+            nn.init.zeros_(b.ada.weight); nn.init.zeros_(b.ada.bias)
+
+    def forward(self, x, t, map_emb, start, goal):
+        B, N, _ = x.shape
+        mod = self.tmod(time_embedding(t, self.temb, x.device))          # (B,model) 时间步调制源
+        mem = self.mem(torch.cat([map_emb, start, goal], dim=1))          # (B,cond_tokens*model)
+        mem = mem.view(B, self.cond_tokens, -1)                            # (B,cond_tokens,model)
+        h = self.proj(x) + self.pos                                       # (B,N,model)
+        for b in self.blocks:
+            h = b(h, mem, mod)
+        return self.head(self.final(h))                                   # (B,N,dim)
+
+
 def build_denoiser(dc):
-    """按 config.DiffusionConfig.denoiser 选架构('mlp' 默认/'conv'/'trans'), 供 train 与 evaluate 共用。"""
+    """按 config.DiffusionConfig.denoiser 选架构('mlp' 默认/'conv'/'trans'/'trans2'), 供 train 与 evaluate 共用。"""
     kind = getattr(dc, "denoiser", "mlp")
     if kind == "conv":
         return CondDenoiserConv(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
@@ -161,6 +224,12 @@ def build_denoiser(dc):
                                        model=dc.dtrans_model, heads=dc.dtrans_heads,
                                        layers=dc.dtrans_layers, ff=dc.dtrans_ff,
                                        dropout=dc.dtrans_dropout)
+    if kind == "trans2":
+        return CondDenoiserTransformer2(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
+                                        model=dc.dtrans_model, heads=dc.dtrans_heads,
+                                        layers=dc.dtrans_layers, ff=dc.dtrans_ff,
+                                        dropout=dc.dtrans_dropout,
+                                        cond_tokens=dc.dtrans_cond_tokens)
     return CondDenoiser(dc.n_wp, dim=dc.dim, temb=dc.temb, map_emb=dc.map_emb,
                         hidden=dc.hidden)
 
