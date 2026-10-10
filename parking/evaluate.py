@@ -202,6 +202,7 @@ def load_model(ckpt=CKPT, cfg=None):
     dc.denoiser = blob.get("denoiser", "mlp")     # 旧 ckpt 无此字段 -> mlp(向后兼容)
     dc.n_wp = int(blob.get("n_wp", dc.n_wp))       # N 随 ckpt(旧 40/缺省 40, N=80 自动 80)
     dc.use_gear = bool(blob.get("use_gear", False))  # M15: 旧 ckpt 无此字段 -> False(向后兼容)
+    dc.pred_mode = blob.get("pred_mode", "eps")       # M16: 旧 ckpt 无此字段 -> eps(向后兼容)
     model = build_denoiser(dc).to(device)
     model.load_state_dict(blob["model"])
     model.eval(); enc.eval()

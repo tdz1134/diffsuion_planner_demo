@@ -207,6 +207,13 @@ M13B 的 `trans` 把条件压成**单个前缀 token**, 不是论文级写法; �
 
 **诚实结论**: gear 作为扩散通道**可学**(表示层突破——去噪器能输出运动学意图), 但**仅把 gear 加进去不能自动带来可行轨迹**; 可行性仍需目标函数层面的约束(M16 x0-空间可行性损失)。ckpt `parking/cache/diffusion_parking_trans2_n80_gear.pt`。
 
+### M16 — x0-空间可行性损失(重参数化为 x0-prediction) — **进行中(代码+安全修复就绪, 完整跑交用户)**
+按文献(FeaXDrive: 把约束从 ε 空间改到轨迹 x0 中心)新增 `config.pred_mode="x0"`(默认 `eps` 向后兼容): 去噪器**直接预测 x0_hat**, 曲率/平滑惩罚施加在 x0_hat 上并进训练(ε-pred 反推 x0 有 1/√ᾱ 放大——M8 发散根因, x0-pred 从根上去掉它)。采样改成 DDPM 后验均值 `mean=coef_x0·x0hat+coef_xt·xt`(端点仍钉住, 实测 `mean_end_pos_err=0`); 新增 `smooth_pen`(二阶位置差分抗拖动)。新开关: `--pred-mode x0 --w-curv-x0 --w-smooth`。
+
+**关键发现(NaN 真因, 重要)**: 第一版 `x0-pred + 曲率惩罚` 在 **~4188 步就 loss/curv/coll 全 NaN**。定位: 曲率项 `κ=|dθ|/ds`, 相邻预测点几乎重合时 `ds→1e-6` → κ 爆到 ~1e6 → 惩罚 ~1e12 → 梯度爆炸。**修复**: `curvature_pen` 里 `ds.clamp(min=5e-3)` + `κ.clamp(max=20)`; 短程验证全程 `loss/curv` 有限、无 NaN。**另**: x0-prediction **本身能训**(control: x0-pred+gear 无惩罚, 30k 完整存盘, k=8 无碰撞 0.375/gear_acc 0.945), 说明炸的是“惩罚×裸 x0-pred”的组合, 不是重参数化单独的问题(文献也提裸 x0-pred 在高噪步梯度不稳, 可考虑 v-prediction)。
+
+**状态(诚实)**: 代码与数值安全修复就绪、默认关不影响基线; control 权重已训。**method(x0-pred+gear+曲率/平滑, 完整 30k) 尚未跑完 → 可行性指标是否真正突破未知**, 已写成带进度条的脚本 `parking/scripts/m16_run.sh`(前台跑能吃 CUDA)交用户执行。判断点: METHOD 那行的 `gear_curv_feasible` 能否上抬(前提同行 `expert_gear_curv_feasible` 偏高, 否则是指标上限而非模型)。
+
 ## 4. 当前指标(12k 数据 / 30k 步重训,60 个 eval 场景,`--cond lat`)
 
 > ⚠ **本表是 Phase-1 MLP + 旧曲率度量(已被 M9 修正)的历史数字**。其中"运动学可行率/成功率"因度量伪artifact被系统性低估(连专家都 0%);最新有效度量与 conv 升级结果见 M9 表。

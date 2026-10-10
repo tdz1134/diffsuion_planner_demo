@@ -226,22 +226,25 @@ def build_denoiser(dc):
     pose_dim = int(dc.dim)
     sd = pose_dim + (1 if getattr(dc, "use_gear", False) else 0)   # state 输出通道数
     if kind == "conv":
-        return CondDenoiserConv(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
-                                hidden=dc.dconv_hidden, layers=dc.dconv_layers,
-                                cond_ch=dc.dconv_cond_ch, pose_dim=pose_dim)
-    if kind == "trans":
-        return CondDenoiserTransformer(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
-                                       model=dc.dtrans_model, heads=dc.dtrans_heads,
-                                       layers=dc.dtrans_layers, ff=dc.dtrans_ff,
-                                       dropout=dc.dtrans_dropout, pose_dim=pose_dim)
-    if kind == "trans2":
-        return CondDenoiserTransformer2(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
-                                        model=dc.dtrans_model, heads=dc.dtrans_heads,
-                                        layers=dc.dtrans_layers, ff=dc.dtrans_ff,
-                                        dropout=dc.dtrans_dropout,
-                                        cond_tokens=dc.dtrans_cond_tokens, pose_dim=pose_dim)
-    return CondDenoiser(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
-                        hidden=dc.hidden, pose_dim=pose_dim)
+        m = CondDenoiserConv(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
+                             hidden=dc.dconv_hidden, layers=dc.dconv_layers,
+                             cond_ch=dc.dconv_cond_ch, pose_dim=pose_dim)
+    elif kind == "trans":
+        m = CondDenoiserTransformer(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
+                                    model=dc.dtrans_model, heads=dc.dtrans_heads,
+                                    layers=dc.dtrans_layers, ff=dc.dtrans_ff,
+                                    dropout=dc.dtrans_dropout, pose_dim=pose_dim)
+    elif kind == "trans2":
+        m = CondDenoiserTransformer2(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
+                                     model=dc.dtrans_model, heads=dc.dtrans_heads,
+                                     layers=dc.dtrans_layers, ff=dc.dtrans_ff,
+                                     dropout=dc.dtrans_dropout,
+                                     cond_tokens=dc.dtrans_cond_tokens, pose_dim=pose_dim)
+    else:
+        m = CondDenoiser(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
+                         hidden=dc.hidden, pose_dim=pose_dim)
+    m.pred_mode = getattr(dc, "pred_mode", "eps")   # M16: 采样时据此选 ε-递推还是 x0-后验
+    return m
 
 
 def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None,
@@ -258,6 +261,7 @@ def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None,
     """
     B = maps.shape[0]
     model.eval(); enc.eval()
+    pred_x0_mode = getattr(model, "pred_mode", "eps") == "x0"    # M16: 网络直接输出 x0_hat
     if critic is not None:
         critic.eval()
     with torch.no_grad():
@@ -274,9 +278,19 @@ def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None,
     for t in reversed(range(T)):
         tt = torch.full((B,), t, device=maps.device, dtype=torch.long)
         with torch.no_grad():
-            eps = model(x, tt, map_emb, starts4, goals4)
-            mean = (x - sch["betas"][t] / torch.sqrt(1.0 - sch["abar"][t]) * eps) \
-                / torch.sqrt(sch["alphas"][t])
+            out = model(x, tt, map_emb, starts4, goals4)
+            if pred_x0_mode:
+                # out = x0_hat。DDPM 后验均值 mean = coef_x0*x0hat + coef_xt*xt(无 1/√ᾱ 放大)。
+                ab = sch["abar"][t]
+                ab_prev = sch["abar"][t - 1] if t > 0 else torch.ones_like(ab)
+                coef_x0 = torch.sqrt(ab_prev) * sch["betas"][t] / (1.0 - ab)
+                coef_xt = torch.sqrt(sch["alphas"][t]) * (1.0 - ab_prev) / (1.0 - ab)
+                mean = coef_x0 * out + coef_xt * x
+                eps = (x - torch.sqrt(ab) * out) / torch.sqrt(1.0 - ab)  # 仅供 guide 反推(默认关不用)
+            else:
+                eps = out
+                mean = (x - sch["betas"][t] / torch.sqrt(1.0 - sch["abar"][t]) * eps) \
+                    / torch.sqrt(sch["alphas"][t])
         if guide is not None and float(sch["abar"][t]) >= min_abar:
             xg = x.detach().requires_grad_(True)
             x0h = pred_x0(xg, eps, sch, tt)

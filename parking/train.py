@@ -22,7 +22,7 @@ from .geometry import normalize_xy, heading_to_cs
 from .map_vae import load_frozen_vae
 from .conditioner import MapConditioner, MapEncoderCNN
 from .diffusion import make_schedule, q_sample, build_denoiser, sample, pred_x0
-from .penalty import traj_penalty_terms
+from .penalty import traj_penalty_terms, smooth_pen
 from .vehicle import Vehicle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,6 +65,7 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
     use_amp = cfg.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     n = x0.shape[0]
+    use_x0 = (getattr(cfg, "pred_mode", "eps") == "x0")     # M16: 直接预测 x0_hat(轨迹中心)
     model.train(); enc.train()
     pbar = tqdm(range(steps), desc="train diffusion", unit="step", ncols=90)
     for step in pbar:
@@ -76,20 +77,25 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
         with torch.amp.autocast("cuda", enabled=use_amp):
             map_emb = enc(m, z=z) if z is not None else enc(m)
             pred = model(xt, t, map_emb, s, g)
-        loss = nn.functional.mse_loss(pred.float(), noise)
+        target = xb if use_x0 else noise                     # x0-pred 监督干净轨迹; 否则监督噪声
+        loss = nn.functional.mse_loss(pred.float(), target)
         postfix = {"loss": f"{loss.item():.4f}"}
         if pen is not None:
-            x0h = pred_x0(xt.float(), pred.float(), sch, t)
+            x0h = pred.float() if use_x0 else pred_x0(xt.float(), pred.float(), sch, t)
+            geo = x0h[..., :4]
             sdf_m = m[:, 1:2] * pen["sdf_clip"]
-            tp = traj_penalty_terms(x0h, sdf_m, pen["bbox"], pen["veh"],
+            tp = traj_penalty_terms(geo, sdf_m, pen["bbox"], pen["veh"],
                                     pen["foot"], pen["margin"])
             gate = sch["abar"][t]                     # (B,) x0_hat 可靠度(t 小→~1)
             aux = (pen["w_nh"] * (gate * tp["nh"]).mean()
                    + pen["w_curv"] * (gate * tp["curv"]).mean()
                    + pen["w_coll"] * (gate * tp["coll"]).mean())
+            if pen.get("w_curv_x0", 0.0):            # M16: x0-pred 下曲率惩罚(良态, 无 1/√ᾱ 放大)
+                aux = aux + pen["w_curv_x0"] * (gate * tp["curv"]).mean()
+            if pen.get("w_smooth", 0.0):             # M16: 一/二阶时序差平滑(治拖动)
+                aux = aux + pen["w_smooth"] * (gate * smooth_pen(geo, pen["bbox"])).mean()
             loss = loss + aux
-            postfix.update(nh=f"{tp['nh'].mean().item():.3f}",
-                           curv=f"{tp['curv'].mean().item():.3f}",
+            postfix.update(curv=f"{tp['curv'].mean().item():.3f}",
                            coll=f"{tp['coll'].mean().item():.3f}")
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -103,7 +109,7 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
 # --------------------------------------------------------------------------- #
 def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKPT,
          w_nh=None, w_curv=None, w_coll=None, coll_margin=None, denoiser=None, n_wp=None,
-         map_cond=None, use_gear=None):
+         map_cond=None, use_gear=None, pred_mode=None, w_curv_x0=None, w_smooth=None):
     cfg = default_config()
     dc = cfg.diffusion
     if denoiser is not None:
@@ -112,6 +118,12 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
         dc.map_cond = map_cond
     if use_gear is not None:
         dc.use_gear = use_gear
+    if pred_mode is not None:
+        dc.pred_mode = pred_mode
+    if w_curv_x0 is not None:
+        dc.w_curv_x0 = w_curv_x0
+    if w_smooth is not None:
+        dc.w_smooth = w_smooth
     if w_nh is not None:
         dc.w_nh = w_nh
     if w_curv is not None:
@@ -163,14 +175,16 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
     print("[model] denoiser=%s trainable params=%.1fK" % (dc.denoiser, npar / 1e3))
 
     pen = None
-    if dc.w_nh or dc.w_curv or dc.w_coll:
+    if dc.w_nh or dc.w_curv or dc.w_coll or dc.w_curv_x0 or dc.w_smooth:
         veh = Vehicle(cfg.vehicle)
         foot = torch.tensor(veh.footprint_local, dtype=torch.float32, device=device)
         pen = dict(w_nh=dc.w_nh, w_curv=dc.w_curv, w_coll=dc.w_coll,
+                   w_curv_x0=dc.w_curv_x0, w_smooth=dc.w_smooth,
                    margin=dc.coll_margin, foot=foot, veh=cfg.vehicle,
                    bbox=bbox, sdf_clip=SDF_CLIP)
-        print("[pen] aux traj loss nh=%g curv=%g coll=%g margin=%.2f clip=%.1fm"
-              % (dc.w_nh, dc.w_curv, dc.w_coll, dc.coll_margin, SDF_CLIP))
+        print("[pen] aux traj loss nh=%g curv=%g coll=%g curv_x0=%g smooth=%g margin=%.2f clip=%.1fm"
+              % (dc.w_nh, dc.w_curv, dc.w_coll, dc.w_curv_x0, dc.w_smooth,
+                 dc.coll_margin, SDF_CLIP))
 
     sch = make_schedule(dc.t_steps, dc.b0, dc.b1, device)
     train(model, enc, x0, maps, s4, g4, sch, dc, steps=steps, batch=batch, lat=lat, pen=pen)
@@ -179,7 +193,7 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
     torch.save({"model": model.state_dict(), "enc": enc.state_dict(),
                 "cond": cond, "n_wp": dc.n_wp, "bbox": bbox,
                 "denoiser": dc.denoiser, "map_cond": dc.map_cond,
-                "use_gear": bool(dc.use_gear)}, out)
+                "use_gear": bool(dc.use_gear), "pred_mode": dc.pred_mode}, out)
     print("[saved] %s" % out)
 
     if quick:   # 冒烟: 采样少量, 校验端点钉住
@@ -211,9 +225,14 @@ if __name__ == "__main__":
                     help="地图条件(cond=lat): lat_sdf=VAE latent⊕SDF(默认), vae=只用 VAE latent")
     ap.add_argument("--use-gear", action="store_true",
                     help="M15: 把档位 gear 作为额外的扩散输出通道(state dim 4->5)")
+    ap.add_argument("--pred-mode", choices=["eps", "x0"], default=None,
+                    help="M16: 去噪预测目标 eps(默认)/x0(轨迹中心, 配 x0 可行性损失)")
+    ap.add_argument("--w-curv-x0", type=float, default=None, help="M16 x0-空间曲率惩罚权重(0=关)")
+    ap.add_argument("--w-smooth", type=float, default=None, help="M16 一/二阶时序差平滑惩罚权重(0=关)")
     ap.add_argument("--n-wp", type=int, default=None,
                     help="定长航点数 N; 缺省自动从数据 traj 推导(向后兼容)")
     a = ap.parse_args()
     main(a.npz, a.steps, a.batch, a.cond, a.quick, a.out,
          w_nh=a.w_nh, w_curv=a.w_curv, w_coll=a.w_coll, coll_margin=a.coll_margin,
-         denoiser=a.denoiser, n_wp=a.n_wp, map_cond=a.map_cond, use_gear=a.use_gear or None)
+         denoiser=a.denoiser, n_wp=a.n_wp, map_cond=a.map_cond, use_gear=a.use_gear or None,
+         pred_mode=a.pred_mode, w_curv_x0=a.w_curv_x0, w_smooth=a.w_smooth)

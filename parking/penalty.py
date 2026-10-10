@@ -51,7 +51,8 @@ def heading_consistency(x0, bbox):
 
 
 def curvature_pen(x0, bbox, inv_rmin):
-    """曲率超限惩罚: mean(relu(|kappa| - 1/r_min)^2), kappa = 单位航向转角 / 弧长(米)。"""
+    """曲率超限惩罚: mean(relu(|kappa| - 1/r_min)^2), kappa = 单位航向转角 / 弧长(米)。
+    M16 数值安全: 相邻点几乎重合时 ds→0 会让 κ 爆到 1e6 使梯度 NaN, 故给 ds 下限并钳 κ≤KAP_CAP。"""
     sx, sy = _scale_xy(bbox)
     c, s = _unit_heading(x0)
     cdot = c[:, :-1] * c[:, 1:] + s[:, :-1] * s[:, 1:]     # cos(dtheta)
@@ -59,9 +60,20 @@ def curvature_pen(x0, bbox, inv_rmin):
     dth = torch.atan2(xcrs, cdot)
     dx = (x0[:, 1:, 0] - x0[:, :-1, 0]) * sx
     dy = (x0[:, 1:, 1] - x0[:, :-1, 1]) * sy
-    ds = torch.hypot(dx, dy) + 1e-6
-    kap = torch.abs(dth) / ds
+    ds = torch.hypot(dx, dy).clamp(min=5e-3)              # 避免 ds→0 使 κ 爆炸(原始点数级间距~百米)
+    kap = (torch.abs(dth) / ds).clamp(max=20.0)           # κ 钳到物理无关心范围上限, 阻断 NaN
     return (torch.relu(kap - inv_rmin) ** 2).mean(dim=1)   # (B,)
+
+
+def smooth_pen(x0, bbox):
+    """平滑惩罚(M16, 学阿里 VLA 一/二阶时序差): 位置二阶差分(米)的均方 = 折返/拖动量。
+    与曲率不同, 它不依赖航向, 直接惩罚航点拖拖抖抖。输入可为 (B,N,>=4)。"""
+    sx, sy = _scale_xy(bbox)
+    xm = x0[:, :, 0] * sx
+    ym = x0[:, :, 1] * sy
+    d1x = xm[:, 1:] - xm[:, :-1]; d1y = ym[:, 1:] - ym[:, :-1]
+    d2x = d1x[:, 1:] - d1x[:, :-1]; d2y = d1y[:, 1:] - d1y[:, :-1]
+    return (d2x ** 2 + d2y ** 2).mean(dim=1)              # (B,)
 
 
 def footprint_collision(x0, sdf_m, bbox, foot_local, margin=0.15):

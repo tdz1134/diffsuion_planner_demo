@@ -131,6 +131,9 @@ class DiffusionConfig:
     denoiser: str = "mlp"
     # Phase 5 (M15): 把档位 gear 作为额外一个扩散输出通道(state dim=dim+1, 前向+1/倒车-1)。默认关=旧 SE(2)4通道管道不变。
     use_gear: bool = False
+    # Phase 5 (M16): 去噪预测目标。eps=旧默认(向后兼容); x0=直接预测干净轨迹 x0_hat(FeaXDrive 轨迹中心),
+    #   使曲率/平滑惩罚直接施加在 x0 上、避开 ε-pred 反推 x0 的 1/√ᾱ 梯度放大(M8 发散根因)。
+    pred_mode: str = "eps"
     # Phase 5 (M16): x0-空间可行性损失(施加在 x0_hat、仅晚步高 abar 时), 默认 0=关(避开 M8 发散)
     w_smooth: float = 0.0        # 一/二阶时序差分平滑(治航点抖动)
     w_curv_x0: float = 0.0       # 速度自适应曲率惩罚 κ_max(v)=min(κ_geo, a_lat/v²)
