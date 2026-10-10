@@ -26,6 +26,11 @@ from .penalty import traj_penalty_terms, smooth_pen
 from .vehicle import Vehicle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 仅开 TF32(不额外吃显存)。注意: 不要开 cudnn.benchmark——它会给 VAE 大 batch(2048)编码
+# 缓存大量卷积 workspace, 在 8GB 卡上直接 OOM(本文件之前加它导致训练爆显存)。
+if device.type == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 _PKG = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_PKG)
 CKPT = os.path.join(_PKG, "cache", "diffusion_parking.pt")
