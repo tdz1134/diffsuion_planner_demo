@@ -114,7 +114,8 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
 # --------------------------------------------------------------------------- #
 def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKPT,
          w_nh=None, w_curv=None, w_coll=None, coll_margin=None, denoiser=None, n_wp=None,
-         map_cond=None, use_gear=None, pred_mode=None, w_curv_x0=None, w_smooth=None):
+         map_cond=None, use_gear=None, pred_mode=None, w_curv_x0=None, w_smooth=None,
+         representation=None, u_scale=None):
     cfg = default_config()
     dc = cfg.diffusion
     if denoiser is not None:
@@ -123,6 +124,10 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
         dc.map_cond = map_cond
     if use_gear is not None:
         dc.use_gear = use_gear
+    if representation is not None:
+        dc.representation = representation
+    if u_scale is not None:
+        dc.ctrl_u_scale = u_scale
     if pred_mode is not None:
         dc.pred_mode = pred_mode
     if w_curv_x0 is not None:
@@ -152,10 +157,19 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
     dc.n_wp = int(n_wp) if n_wp else int(d["traj"].shape[1])
     tr_mask = d["split"] == 0
     maps = torch.tensor(d["maps"][tr_mask], device=device)
-    x0 = torch.tensor(norm_traj4(d["traj"][tr_mask], bbox), device=device)
-    if dc.use_gear:                                   # M15: 档位作为额外一个扩散输出通道(已∈[-1,1], 不再归一)
-        gch = torch.tensor(d["gear"][tr_mask], dtype=torch.float32, device=device)[:, :, None]
-        x0 = torch.cat([x0, gch], dim=-1)             # (N,4)->(N,5)
+    if getattr(dc, "representation", "pose") == "ctrl":     # M17: 专家 pose+gear -> 控制序列 (M,N,2)
+        from .controlspace import encode_ctrl
+        kmax = 1.0 / cfg.vehicle.r_min
+        ctrl = np.stack([encode_ctrl(d["traj"][tr_mask][i], d["gear"][tr_mask][i],
+                                      kmax, dc.ctrl_u_scale) for i in range(int(tr_mask.sum()))])
+        x0 = torch.tensor(ctrl, device=device)
+        print("[ctrl] state=控制空间(kappa,u) x0=%s kappa_max=%.3f u_scale=%.2fm"
+              % (tuple(x0.shape), kmax, dc.ctrl_u_scale))
+    else:
+        x0 = torch.tensor(norm_traj4(d["traj"][tr_mask], bbox), device=device)
+        if dc.use_gear:                                   # M15: 档位作为额外一个扩散输出通道(已∈[-1,1], 不再归一)
+            gch = torch.tensor(d["gear"][tr_mask], dtype=torch.float32, device=device)[:, :, None]
+            x0 = torch.cat([x0, gch], dim=-1)             # (N,4)->(N,5)
     s4 = torch.tensor(pose3_to_norm4(d["start_pose"][tr_mask], bbox), device=device)
     g4 = torch.tensor(pose3_to_norm4(d["goal_pose"][tr_mask], bbox), device=device)
     print("[info] device=%s npz=%s train=%d x0=%s" % (device, npz_path,
@@ -191,6 +205,12 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
               % (dc.w_nh, dc.w_curv, dc.w_coll, dc.w_curv_x0, dc.w_smooth,
                  dc.coll_margin, SDF_CLIP))
 
+    # M17: ctrl(控制空间)下 pose-空间几何惩罚作用对象(x0h[...,:4])无意义——曲率/非完整由构造保证,
+    #   碰撞交给 evaluate 的事后 repair。故强制关闭, 避免误用又踩 M8/M16 的发散坑。
+    if getattr(dc, "representation", "pose") == "ctrl" and pen is not None:
+        print("[warn] representation=ctrl: pose-空间几何惩罚不适用(可行性由构造保证), 已忽略 --w-*; 仅用 MSE(ctrl) 训练")
+        pen = None
+
     sch = make_schedule(dc.t_steps, dc.b0, dc.b1, device)
     train(model, enc, x0, maps, s4, g4, sch, dc, steps=steps, batch=batch, lat=lat, pen=pen)
 
@@ -198,17 +218,26 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
     torch.save({"model": model.state_dict(), "enc": enc.state_dict(),
                 "cond": cond, "n_wp": dc.n_wp, "bbox": bbox,
                 "denoiser": dc.denoiser, "map_cond": dc.map_cond,
-                "use_gear": bool(dc.use_gear), "pred_mode": dc.pred_mode}, out)
+                "use_gear": bool(dc.use_gear), "pred_mode": dc.pred_mode,
+                "representation": dc.representation, "ctrl_u_scale": float(dc.ctrl_u_scale)}, out)
     print("[saved] %s" % out)
 
-    if quick:   # 冒烟: 采样少量, 校验端点钉住
+    if quick:   # 冒烟: 采样少量
         k = min(8, x0.shape[0])
         gen = sample(model, enc, maps[:k], s4[:k], g4[:k], sch,
                      z=(lat[:k] if lat is not None else None))
-        e0 = (gen[:, 0] - s4[:k]).abs().max().item()
-        e1 = (gen[:, -1] - g4[:k]).abs().max().item()
-        print("[smoke] sample ok shape=%s  pin err start=%.2e goal=%.2e"
-              % (tuple(gen.shape), e0, e1))
+        if getattr(dc, "representation", "pose") == "ctrl":
+            from .controlspace import integrate_ctrl
+            kmax = 1.0 / cfg.vehicle.r_min
+            st = torch.tensor(d["start_pose"][tr_mask][:k], dtype=torch.float32, device=device)
+            pose = integrate_ctrl(gen, st, kmax, dc.ctrl_u_scale)   # (k,N,4) 世界
+            print("[smoke ctrl] sample shape=%s -> integrate %s (端点不钉, 靠条件+修复)"
+                  % (tuple(gen.shape), tuple(pose.shape)))
+        else:
+            e0 = (gen[:, 0] - s4[:k]).abs().max().item()
+            e1 = (gen[:, -1] - g4[:k]).abs().max().item()
+            print("[smoke] sample ok shape=%s  pin err start=%.2e goal=%.2e"
+                  % (tuple(gen.shape), e0, e1))
     return model, enc
 
 
@@ -230,6 +259,9 @@ if __name__ == "__main__":
                     help="地图条件(cond=lat): lat_sdf=VAE latent⊕SDF(默认), vae=只用 VAE latent")
     ap.add_argument("--use-gear", action="store_true",
                     help="M15: 把档位 gear 作为额外的扩散输出通道(state dim 4->5)")
+    ap.add_argument("--representation", choices=["pose", "ctrl"], default=None,
+                    help="M17: 扩散状态表示 pose(默认)/ctrl(控制空间, 可行性由构造保证)")
+    ap.add_argument("--u-scale", type=float, default=None, help="M17 ctrl: 带符号弧长归一化尺度(m)")
     ap.add_argument("--pred-mode", choices=["eps", "x0"], default=None,
                     help="M16: 去噪预测目标 eps(默认)/x0(轨迹中心, 配 x0 可行性损失)")
     ap.add_argument("--w-curv-x0", type=float, default=None, help="M16 x0-空间曲率惩罚权重(0=关)")
@@ -240,4 +272,5 @@ if __name__ == "__main__":
     main(a.npz, a.steps, a.batch, a.cond, a.quick, a.out,
          w_nh=a.w_nh, w_curv=a.w_curv, w_coll=a.w_coll, coll_margin=a.coll_margin,
          denoiser=a.denoiser, n_wp=a.n_wp, map_cond=a.map_cond, use_gear=a.use_gear or None,
-         pred_mode=a.pred_mode, w_curv_x0=a.w_curv_x0, w_smooth=a.w_smooth)
+         pred_mode=a.pred_mode, w_curv_x0=a.w_curv_x0, w_smooth=a.w_smooth,
+         representation=a.representation, u_scale=a.u_scale)

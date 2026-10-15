@@ -212,7 +212,23 @@ M13B 的 `trans` 把条件压成**单个前缀 token**, 不是论文级写法; �
 
 **关键发现(NaN 真因, 重要)**: 第一版 `x0-pred + 曲率惩罚` 在 **~4188 步就 loss/curv/coll 全 NaN**。定位: 曲率项 `κ=|dθ|/ds`, 相邻预测点几乎重合时 `ds→1e-6` → κ 爆到 ~1e6 → 惩罚 ~1e12 → 梯度爆炸。**修复**: `curvature_pen` 里 `ds.clamp(min=5e-3)` + `κ.clamp(max=20)`; 短程验证全程 `loss/curv` 有限、无 NaN。**另**: x0-prediction **本身能训**(control: x0-pred+gear 无惩罚, 30k 完整存盘, k=8 无碰撞 0.375/gear_acc 0.945), 说明炸的是“惩罚×裸 x0-pred”的组合, 不是重参数化单独的问题(文献也提裸 x0-pred 在高噪步梯度不稳, 可考虑 v-prediction)。
 
-**状态(诚实)**: 代码与数值安全修复就绪、默认关不影响基线; control 权重已训。**method(x0-pred+gear+曲率/平滑, 完整 30k) 尚未跑完 → 可行性指标是否真正突破未知**, 已写成带进度条的脚本 `parking/scripts/m16_run.sh`(前台跑能吃 CUDA)交用户执行。判断点: METHOD 那行的 `gear_curv_feasible` 能否上抬(前提同行 `expert_gear_curv_feasible` 偏高, 否则是指标上限而非模型)。
+**状态(诚实)**: 代码与数值安全修复就绪、默认关不影响基线; control 权重已训。**method(x0-pred+gear+曲率/平滑, 完整 30k) 尚未跑完 → 可行性指标是否真正突破未知**, 已写成带进度条的脚本 `parking/scripts/m16_run.sh`(前台跑能吃 CUDA)交用户执行。判断点: METHOD 那行的 `gear_curv_feasible` 能否上抬(前提同行 `expert_gear_curv_feasible` 偏高, 否则是指标上限而非模型)。**后续复盘**: 用户跑 STEPS=12000 的 method 仍 **77/77 参数张量全 NaN** → 印证“把几何代价塞进训练(ε 或 x0 空间)本质不稳”, M16 路线证伪, 转向 M17。
+
+### M17 — 控制空间扩散(可行性由构造保证) — **正向里程碑: 首次真正解决运动学可行性(曲率+非完整), 但代价是端点精度与避障**
+换一种根本思路: 不再在 pose 空间生成 `(x,y,cos,sin)` 再事后测曲率, 而是让网络**直接扩散逐段控制 `(κ, u)`**(u=gear·ds 带符号弧长), 再用 `parking/controlspace.integrate_ctrl` 等曲率弧闭式积分回位姿。于是 **速度恒 ∥ 航向 → 非完整零滑移天然满足; |κ|≤κmax(编解码都钳位)→ 曲率天然达标**, 完全绕开 M8/M12/M16 “往训练/引导塞几何代价就发散”的病态根。新开关 `config.representation="ctrl"`(默认 `pose` 向后兼容)、`ctrl_u_scale`(默认 0.4); `build_denoiser` ctrl 时状态 2 通道而条件仍 4 维 pose; `sample()` ctrl 时自动不钉端点(宽度≠4); train 里 ctrl **强制关闭 pose-空间几何惩罚**(guard), evaluate 里 ctrl 走 `integrate_ctrl` 回世界位姿、预测档位取自 `sign(u)`。自检: encode→integrate round-trip `max|κ|=0.222=κmax` 逐例相等(构造成立), 代价是位置漂移 ~1m(专家紧弯段 `Δθ/Δs` 略超 κmax 被钳所致)。
+
+**完整 30k 结果(60 个 eval 场景, 引导关, `parking/cache/diffusion_parking_ctrl_n80.pt`)** — 运动学可行“构造即满足”完全成立(M14/M15 从未做到):
+- `raw_feasible=**1.0**`(非完整滑移硬门全场景通过, 滑移均值 0.008; M14/M15 均为 0.0)。
+- `gear_curv_feasible=**0.717**` > `expert_gear_curv_feasible=0.5`(曲率硬门首次突破, 甚至高于专家——pose 表示 N=80 欠分辨而 ctrl 钳位重构更平滑; M15 为 0.0)。
+- `raw_gear_switches=2.65`≈专家 2.6(欠训练冒烟的 14.25 抖动在满训后**消失**); `raw_seg_kappa=0.54`(vs pose 模型 ~3.2)。
+
+**代价(诚实, 新短板)**:
+- 端点/GPS 不精确: `mean_end_pos_err=1.74m`、`mean_end_ang_err=14.0°`(控制空间无法像 pose 那样硬钉首尾, M14=0.0)。
+- 避障差: `raw_collision_free=0.083`、`rep_collision_free=0.133`(比 M15 的 0.2/0.3 还低); 且 `rep_feasible` 从 1.0 掉到 0.3——**事后 repair 在 pose 空间挪点避碰又把构造保证的运动学可行破坏了**, 二者对冲。根因: ctrl 训练只管运动学不含障碍, 且端点偏差使路径落入障碍。
+
+**净评价**: 把表示从位姿空间换到控制空间 = 用“目标到达精度 + 避障”换“运动学绝对可行”。运动学是本项目 M8~M16 一直无解的硬骨头, 本次真解决了; 剩下的是碰撞与终点精度。
+
+**下一步(M18, 未做)**: 在 ctrl 空间加**良态可微损失**(不碰 κ=|dθ|/ds 病态)——(a)对 `integrate_ctrl` 终点与 goal 的距离做目标到达惩罚(修端点误差, 并间接改善碰撞); (b)对积分位姿的足迹 SDF 做碰撞惩罚(直接修 8% 无碰撞)。二者都经 N=80 串行积分回传, 需监控稳定性。
 
 ## 4. 当前指标(12k 数据 / 30k 步重训,60 个 eval 场景,`--cond lat`)
 

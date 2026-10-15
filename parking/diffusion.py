@@ -224,7 +224,10 @@ def build_denoiser(dc):
     """
     kind = getattr(dc, "denoiser", "mlp")
     pose_dim = int(dc.dim)
-    sd = pose_dim + (1 if getattr(dc, "use_gear", False) else 0)   # state 输出通道数
+    if getattr(dc, "representation", "pose") == "ctrl":   # M17: 控制空间 2 通道(κ,u), 条件仍用 4 维 pose
+        sd = 2
+    else:
+        sd = pose_dim + (1 if getattr(dc, "use_gear", False) else 0)   # state 输出通道数
     if kind == "conv":
         m = CondDenoiserConv(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
                              hidden=dc.dconv_hidden, layers=dc.dconv_layers,
@@ -268,7 +271,8 @@ def sample(model, enc, maps, starts4, goals4, sch, z=None, pin=True, guide=None,
         map_emb = enc(maps, z=z) if z is not None else enc(maps)
     T = sch["T"]
     x = torch.randn(B, model.n_wp, model.dim, device=maps.device)
-    pdim = starts4.shape[-1]                              # pose 通道数(4); use_gear 时 x 多一列档位不钉
+    pdim = starts4.shape[-1]                              # pose 通道数(4)
+    pin = pin and (pdim == x.shape[-1])                   # ctrl(dim=2)与 pose 宽度不同 -> 自动不钉(端点靠条件+后处理)
     if pin:
         x[:, 0, :pdim] = starts4; x[:, -1, :pdim] = goals4
     if guide is not None:

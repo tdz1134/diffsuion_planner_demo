@@ -203,9 +203,13 @@ def load_model(ckpt=CKPT, cfg=None):
     dc.n_wp = int(blob.get("n_wp", dc.n_wp))       # N 随 ckpt(旧 40/缺省 40, N=80 自动 80)
     dc.use_gear = bool(blob.get("use_gear", False))  # M15: 旧 ckpt 无此字段 -> False(向后兼容)
     dc.pred_mode = blob.get("pred_mode", "eps")       # M16: 旧 ckpt 无此字段 -> eps(向后兼容)
+    dc.representation = blob.get("representation", "pose")   # M17: 旧 ckpt 无此字段 -> pose(向后兼容)
+    dc.ctrl_u_scale = float(blob.get("ctrl_u_scale", 1.0))
     model = build_denoiser(dc).to(device)
     model.load_state_dict(blob["model"])
     model.eval(); enc.eval()
+    model.representation = dc.representation          # M17: 供 evaluate 判断是否需 integrate_ctrl 回位姿
+    model.ctrl_u_scale = dc.ctrl_u_scale
     return model, enc, blob.get("bbox", (0, 0, cfg.lot.world_w, cfg.lot.world_h)), cond
 
 
@@ -265,7 +269,20 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         critic = load_critic(ckw["path"]); c_scale = float(ckw["scale"])
         c_minabar = float(ckw.get("min_abar", 0.9))
     gen_n = sample(model, enc, maps_t, s4, g4, sch, z=lat, guide=guide,
-                   critic=critic, critic_scale=c_scale, critic_min_abar=c_minabar).cpu().numpy()   # (k,N,4) norm
+                   critic=critic, critic_scale=c_scale, critic_min_abar=c_minabar).cpu().numpy()   # pose:(k,N,4/5) norm | ctrl:(k,N,2)
+
+    # M17: ctrl 表示——将归一化控制 (k,N,2) 可微积分回世界位姿 (k,N,4)(曲率/非完整由构造保证)。
+    #   预测档位由带符号弧长 u 的符号得到; 端点不钉(靠条件+事后 repair), 故终点误差可能非 0。
+    is_ctrl = getattr(model, "representation", "pose") == "ctrl"
+    world4 = pgear_all = None
+    if is_ctrl:
+        from .controlspace import integrate_ctrl
+        kmax = 1.0 / veh.cfg.r_min
+        ctrl_t = torch.tensor(gen_n, dtype=torch.float32, device=device)          # (k,N,2)
+        st_t = torch.tensor(sp[:k], dtype=torch.float32, device=device)           # (k,3) 世界起点
+        world4 = integrate_ctrl(ctrl_t, st_t, kmax,
+                                 getattr(model, "ctrl_u_scale", 1.0)).cpu().numpy()  # (k,N,4) 世界
+        pgear_all = np.sign(gen_n[:, :, 1])                                        # (k,N) ±1(由带符号弧长推档位)
 
     res = cfg.lot.res
     rmin = veh.cfg.r_min
@@ -278,11 +295,15 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
     cases = []
     for i in range(k):
         grid = maps[i, 0]
-        # 生成: 归一化 -> 世界 (use_gear 时列 4 为预测档位)
-        gene = gen_n[i].copy()
-        gen4 = gene[:, :4].copy()
-        pgear = gene[:, 4] if gene.shape[1] > 4 else None
-        gen4[:, :2] = denormalize_xy(gen4[:, :2], *bbox)
+        # 生成: 归一化 -> 世界 (use_gear 时列 4 为预测档位); ctrl 时 world4 已是世界位姿、档位来自 u 符号
+        if is_ctrl:
+            gen4 = world4[i].copy()
+            pgear = pgear_all[i]
+        else:
+            gene = gen_n[i].copy()
+            gen4 = gene[:, :4].copy()
+            pgear = gene[:, 4] if gene.shape[1] > 4 else None
+            gen4[:, :2] = denormalize_xy(gen4[:, :2], *bbox)
         # --- 原始 ---
         gposes = densify_traj4(gen4)
         col = footprint_collides(grid, gposes, veh, res)

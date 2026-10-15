@@ -131,6 +131,10 @@ class DiffusionConfig:
     denoiser: str = "mlp"
     # Phase 5 (M15): 把档位 gear 作为额外一个扩散输出通道(state dim=dim+1, 前向+1/倒车-1)。默认关=旧 SE(2)4通道管道不变。
     use_gear: bool = False
+    # Phase 5 (M17): 扩散状态表示。pose=旧 SE(2) x,y,cos,sin(默认, 向后兼容); ctrl=控制空间(κ归一, 带符号弧长 u=gear*ds) 2通道,
+    #   经 parking/controlspace.integrate_ctrl 运动学积分回位姿 -> 曲率/非完整可行性由构造保证(不再需几何代价)。
+    representation: str = "pose"
+    ctrl_u_scale: float = 0.4    # ctrl 表示下带符号弧长 u 的归一化尺度(m): 均匀 N=80 重采样后每段 |ds|~0.1–0.36m, 取 0.4 使 u_n≈±0.9 与 κ_n 量级均衡(不影响 round-trip 保真, 仅影响 DDPM 归一)
     # Phase 5 (M16): 去噪预测目标。eps=旧默认(向后兼容); x0=直接预测干净轨迹 x0_hat(FeaXDrive 轨迹中心),
     #   使曲率/平滑惩罚直接施加在 x0 上、避开 ε-pred 反推 x0 的 1/√ᾱ 梯度放大(M8 发散根因)。
     pred_mode: str = "eps"
