@@ -10,6 +10,7 @@ forward(m, z=None): m=(B,2,H,W) [占据, SDF]; z 为预存 latent(训练热循�
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .interfaces import MapConditionerABC
 
@@ -65,6 +66,38 @@ class MapConditioner(nn.Module, MapConditionerABC):
             return self.lat_enc(z)
         sdf = m[:, 1:2]
         return torch.cat([self.lat_enc(z), self.sdf_enc(sdf)], dim=1)
+
+
+class SpatialMapConditioner(nn.Module, MapConditionerABC):
+    """M19: 复用冻结 VAE 的**空间 latent 栅格** (B, lat_ch, gh, gw) 直接作 cross-attn 的 key,
+    不再 flatten 成全局向量(那会销毁"航点<->地图格子"的空间对应)。
+
+    每个栅格 -> 1 个 token(通道 = lat_ch, 可选再拼该格局部 SDF 间隙 +1), 加 2D 可学位置编码。
+    输出 (B, gh*gw, out_ch) 供 CondDenoiserTransformer3 的每层 cross-attention 读取。
+    forward(m, z=None): m=(B,2,H,W)[占据,SDF]; z 为预存 latent(热循环传入, 免重跑 VAE)。
+    """
+
+    def __init__(self, vae, lat_hw=(9, 16), lat_ch=8, out_ch=64, use_sdf=True):
+        super().__init__()
+        self.vae = vae                                   # 冻结(仅当未预存 z 时现算)
+        self.gh, self.gw = int(lat_hw[0]), int(lat_hw[1])
+        self.use_sdf = use_sdf
+        in_ch = lat_ch + (1 if use_sdf else 0)
+        self.proj = nn.Linear(in_ch, out_ch)
+        self.pos = nn.Parameter(torch.zeros(1, self.gh * self.gw, out_ch))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+
+    def forward(self, m, z=None):
+        if z is None:
+            with torch.no_grad():
+                z = self.vae.encode(m[:, 0:1])                        # (B, lat_ch, gh, gw)
+        B = z.shape[0]
+        tok = z.permute(0, 2, 3, 1).reshape(B, self.gh * self.gw, -1)  # (B, gh*gw, lat_ch)
+        if self.use_sdf:
+            sdf = F.adaptive_avg_pool2d(m[:, 1:2], (self.gh, self.gw))  # (B,1,gh,gw)
+            sdf = sdf.permute(0, 2, 3, 1).reshape(B, self.gh * self.gw, 1)
+            tok = torch.cat([tok, sdf], dim=-1)                         # (B, gh*gw, lat_ch+1)
+        return self.proj(tok) + self.pos                                # (B, gh*gw, out_ch)
 
 
 class MapEncoderCNN(nn.Module, MapConditionerABC):

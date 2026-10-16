@@ -21,6 +21,8 @@
 import numpy as np
 import torch
 
+from .penalty import footprint_collision
+
 
 # --------------------------------------------------------------------------- #
 # numpy: 专家 pose+gear -> 归一化控制 (供 dataset 侧编码)
@@ -98,12 +100,25 @@ def goal_reach_pen(ctrl, start3_w, goal_n4, bbox, kappa_max, u_scale):
 # --------------------------------------------------------------------------- #
 # M18b: 测试时终点投影——把已采样的控制序列用可微积分拉到终点=goal(不重训)
 # --------------------------------------------------------------------------- #
+def _world_to_norm(poses_w, bbox):
+    """世界位姿 (...,4)[x,y,cos,sin](米) -> 归一化 (...,4) (x,y∈[-1,1]), 供 footprint_collision 采样。"""
+    bx0, by0, bx1, by1 = bbox
+    wx = max(bx1 - bx0, 1e-9); hy = max(by1 - by0, 1e-9)
+    nx = (poses_w[..., 0] - bx0) / wx * 2.0 - 1.0
+    ny = (poses_w[..., 1] - by0) / hy * 2.0 - 1.0
+    return torch.stack([nx, ny, poses_w[..., 2], poses_w[..., 3]], dim=-1)
+
+
 def refine_ctrl_to_goal(ctrl, start3_w, goal_n4, bbox, kappa_max, u_scale,
-                        iters=80, lr=0.05, w_pos=1.0, w_ang=0.3):
+                        iters=80, lr=0.05, w_pos=1.0, w_ang=0.3, coll=None):
     """ctrl:(B,N,2)已采样归一化控制, start3_w:(B,3)世界起点, goal_n4:(B,4)归一化目标。
     对控制序列做几步 Adam 梯度下降, 最小化终点位置+航向误差(goal_reach_pen)。
     κ 通道每步钳到 [-1,1] -> **曲率/非完整构造保证不被破坏**(只优化终点)。
     iters<=0 直接返回原 ctrl。返回优化后 ctrl(B,N,2)。
+
+    M19b: coll=dict(sdf_m(B,1,H,W)米, foot(P,2)米, margin, w_coll) 且 w_coll>0 时,
+    叠加可微足迹-SDF 碰撞代价(经 integrate_ctrl 回传), **终点+避障一起投影**。
+    coll=None 时与旧 M18b 行为逐字一致(向后兼容)。
     """
     if iters is None or iters <= 0:
         return ctrl
@@ -111,11 +126,18 @@ def refine_ctrl_to_goal(ctrl, start3_w, goal_n4, bbox, kappa_max, u_scale,
     def _bounded(c):
         return torch.cat([c[..., 0:1].clamp(-1.0, 1.0), c[..., 1:2]], dim=-1)
 
+    use_coll = bool(coll) and float(coll.get("w_coll", 0.0)) > 0
     c = ctrl.detach().clone().requires_grad_(True)
     opt = torch.optim.Adam([c], lr=lr)
     for _ in range(iters):
-        pe, ae = goal_reach_pen(_bounded(c), start3_w, goal_n4, bbox, kappa_max, u_scale)
+        cb = _bounded(c)
+        pe, ae = goal_reach_pen(cb, start3_w, goal_n4, bbox, kappa_max, u_scale)
         loss = (w_pos * pe + w_ang * ae).sum()
+        if use_coll:
+            poses = integrate_ctrl(cb, start3_w, kappa_max, u_scale)      # (B,N,4) 世界
+            cc = footprint_collision(_world_to_norm(poses, bbox), coll["sdf_m"], bbox,
+                                     coll["foot"], coll["margin"])          # (B,)
+            loss = loss + float(coll["w_coll"]) * cc.sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()

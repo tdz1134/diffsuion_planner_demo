@@ -216,6 +216,44 @@ class CondDenoiserTransformer2(nn.Module):
         return self.head(self.final(h))                                   # (B,N,dim)
 
 
+class CondDenoiserTransformer3(nn.Module):
+    """M19: 忠实条件 Transformer, 但每层 cross-attention 读**空间地图 token**(而非全局摘要)。
+
+    与 trans2 唯一区别: 条件 memory 不再由 map_emb(64) 展开成 cond_tokens, 而是把地图编码器
+    输出的空间栅格 token (B, Nmap, map_ch) 直接投影成 memory, 再拼 start/goal 两个 token。于是
+    每个航点能对**具体地图位置**做注意力, 从而从图像学到"哪里是障碍"。接口: (x,t,map_tokens,start,goal)->eps。
+    """
+
+    def __init__(self, n_wp, dim=4, temb=64, map_ch=64, model=128, heads=4,
+                 layers=4, ff=256, dropout=0.1, pose_dim=None):
+        super().__init__()
+        self.n_wp, self.dim, self.temb = n_wp, dim, temb
+        self.pose_dim = dim if pose_dim is None else pose_dim
+        self.proj = nn.Linear(dim, model)
+        self.pos = nn.Parameter(torch.zeros(1, n_wp, model))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.mem_proj = nn.Linear(map_ch, model)                 # 空间地图 token -> model
+        self.sg_proj = nn.Linear(self.pose_dim, model)           # start/goal 各 -> 1 token
+        self.tmod = nn.Sequential(nn.Linear(temb, model), nn.SiLU(), nn.Linear(model, model))
+        self.blocks = nn.ModuleList([_CondBlock(model, heads, ff, dropout) for _ in range(layers)])
+        self.final = nn.LayerNorm(model, elementwise_affine=False)
+        self.head = nn.Linear(model, dim)
+        for b in self.blocks:                                    # AdaLN-Zero: gate 初始化 0
+            nn.init.zeros_(b.ada.weight); nn.init.zeros_(b.ada.bias)
+
+    def forward(self, x, t, map_tok, start, goal):
+        B, N, _ = x.shape
+        mod = self.tmod(time_embedding(t, self.temb, x.device))          # (B,model) 时间步调制
+        mem = self.mem_proj(map_tok)                                     # (B,Nmap,model) 空间地图
+        sg = torch.cat([self.sg_proj(start)[:, None, :],
+                        self.sg_proj(goal)[:, None, :]], dim=1)          # (B,2,model)
+        mem = torch.cat([mem, sg], dim=1)                                # (B,Nmap+2,model)
+        h = self.proj(x) + self.pos                                      # (B,N,model)
+        for b in self.blocks:
+            h = b(h, mem, mod)
+        return self.head(self.final(h))                                  # (B,N,dim)
+
+
 def build_denoiser(dc):
     """按 config.DiffusionConfig.denoiser 选架构('mlp'/'conv'/'trans'/'trans2'), 供 train 与 evaluate 共用。
 
@@ -243,6 +281,11 @@ def build_denoiser(dc):
                                      layers=dc.dtrans_layers, ff=dc.dtrans_ff,
                                      dropout=dc.dtrans_dropout,
                                      cond_tokens=dc.dtrans_cond_tokens, pose_dim=pose_dim)
+    elif kind == "trans3":
+        m = CondDenoiserTransformer3(dc.n_wp, dim=sd, temb=dc.temb, map_ch=dc.map_emb,
+                                     model=dc.dtrans_model, heads=dc.dtrans_heads,
+                                     layers=dc.dtrans_layers, ff=dc.dtrans_ff,
+                                     dropout=dc.dtrans_dropout, pose_dim=pose_dim)
     else:
         m = CondDenoiser(dc.n_wp, dim=sd, temb=dc.temb, map_emb=dc.map_emb,
                          hidden=dc.hidden, pose_dim=pose_dim)

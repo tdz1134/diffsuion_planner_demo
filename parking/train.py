@@ -20,7 +20,7 @@ from .config import default_config
 from .dataset import load_dataset, SDF_CLIP
 from .geometry import normalize_xy, heading_to_cs
 from .map_vae import load_frozen_vae
-from .conditioner import MapConditioner, MapEncoderCNN
+from .conditioner import MapConditioner, MapEncoderCNN, SpatialMapConditioner
 from .diffusion import make_schedule, q_sample, build_denoiser, sample, pred_x0
 from .penalty import traj_penalty_terms, smooth_pen
 from .controlspace import goal_reach_pen
@@ -188,15 +188,21 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
                                                       x0.shape[0], tuple(x0.shape)))
 
     lat = None
-    if cond == "lat":
-        use_sdf = getattr(dc, "map_cond", "lat_sdf") == "lat_sdf"
+    if cond in ("lat", "spatial"):
         vae = load_frozen_vae(lat_ch=dc.lat_ch)
-        enc = MapConditioner(vae, out_dim=dc.map_emb,
-                             lat_hw=(maps.shape[2] // 8, maps.shape[3] // 8),
-                             use_sdf=use_sdf).to(device)
+        lat_hw = (maps.shape[2] // 8, maps.shape[3] // 8)
+        if cond == "spatial":
+            enc = SpatialMapConditioner(vae, lat_hw=lat_hw, lat_ch=dc.lat_ch,
+                                        out_ch=dc.map_emb,
+                                        use_sdf=(getattr(dc, "map_cond", "lat_sdf") != "vae")).to(device)
+            print("[cond] spatial: 复用冻结 VAE latent 栅格 %s 作 cross-attn token (use_sdf=%s)"
+                  % (lat_hw, enc.use_sdf))
+        else:
+            use_sdf = getattr(dc, "map_cond", "lat_sdf") == "lat_sdf"
+            enc = MapConditioner(vae, out_dim=dc.map_emb, lat_hw=lat_hw, use_sdf=use_sdf).to(device)
+            print("[cond] frozen-VAE %s" % ("latent+SDF" if use_sdf else "latent-only(vae)"))
         lat = precompute_latents(enc.vae, maps)
-        print("[cond] frozen-VAE %s; precomputed lat %s"
-              % ("latent+SDF" if use_sdf else "latent-only(vae)", tuple(lat.shape)))
+        print("[cond] precomputed lat %s" % (tuple(lat.shape),))
     else:
         enc = MapEncoderCNN(out_dim=dc.map_emb).to(device)
         print("[cond] CNN baseline")
@@ -267,15 +273,16 @@ if __name__ == "__main__":
     ap.add_argument("--npz", type=str, default=None)
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--batch", type=int, default=None)
-    ap.add_argument("--cond", choices=["lat", "cnn"], default="lat")
+    ap.add_argument("--cond", choices=["lat", "cnn", "spatial"], default="lat",
+                    help="地图条件: lat=冻结VAE latent+SDF全局向量(默认); spatial=M19 复用latent栅格作cross-attn token; cnn=纯CNN基线")
     ap.add_argument("--out", type=str, default=CKPT)
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--w-nh", type=float, default=None, help="Phase2 航向一致性损失权重(0=关)")
     ap.add_argument("--w-curv", type=float, default=None, help="Phase2 曲率超限损失权重(0=关)")
     ap.add_argument("--w-coll", type=float, default=None, help="Phase2 足迹碰撞损失权重(0=关)")
     ap.add_argument("--coll-margin", type=float, default=None, help="足迹碰撞安全间隙(m)")
-    ap.add_argument("--denoiser", choices=["mlp", "conv", "trans", "trans2"], default=None,
-                    help="去噪器架构: conv=1D 时序卷积, trans=旧 Transformer(单前缀token), trans2=忠实版(cross-attn+AdaLN); 缺省用 config(mlp)")
+    ap.add_argument("--denoiser", choices=["mlp", "conv", "trans", "trans2", "trans3"], default=None,
+                    help="去噪器架构: conv=1D 时序卷积, trans=旧 Transformer(单前缀token), trans2=忠实版(cross-attn+AdaLN), trans3=M19(cross-attn读空间地图token); 缺省用 config(mlp)")
     ap.add_argument("--map-cond", choices=["lat_sdf", "vae"], default=None,
                     help="地图条件(cond=lat): lat_sdf=VAE latent⊕SDF(默认), vae=只用 VAE latent")
     ap.add_argument("--use-gear", action="store_true",

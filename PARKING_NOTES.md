@@ -244,6 +244,15 @@ M13B 的 `trans` 把条件压成**单个前缀 token**, 不是论文级写法; �
 
 **净结论**: M17(构造运动学可行) + M18b(测试时投影修端点) = 运动学可行且终点精确、无需重训; 碰撞是唯一未攻项(根因: ctrl 训练不含障碍 + pose-空间事后 repair 会反破坏构造可行)。**下一步候选(M19, 未做)**: 同样走**测试时**路线避免重训练发散——在 `refine_ctrl_to_goal` 里加一项可微足迹 SDF 碰撞代价(也经 integrate_ctrl, 有界良态), 终点+避障一起投影; 或端到端地用“投影后轨迹”监督一个新 critic。
 
+### M19 — 空间地图条件(trans3 + SpatialMapConditioner): 让网络"从图像看见障碍" — **部分正向(碰撞 0.083→0.15), 证实"看不见"诊断**
+用户洞察: 专家数据本就无碰撞, 监督信号一直在, 缺的是"看得见障碍"。核对 `conditioner.py` 坐实病因: `MapConditioner` 把冻结 VAE 的**空间 latent 栅格 (8,9,16) 经 `Linear(1152→32)` 拍成全局向量**(SDF 支也 AvgPool→32), 再经 trans2 展成 8 个 token → **航点与地图格子零空间对应**, 障碍位置在池化那刻被销毁。修法(全 flag 门控、默认不变): 新增 `conditioner.SpatialMapConditioner`——**复用同一冻结 VAE latent, 但不拍平**, 把 (8,9,16) 拆成 **144 个空间 token**(每格 8 维 latent + 可选 1 维局部 SDF), 各加 2D 可学位置编码; 新增 `diffusion.CondDenoiserTransformer3`(trans3, 与 trans2 同款 DiT, 唯一区别是每层 cross-attn 的 key 换成这 144 空间 token)。接入 `train/evaluate --cond spatial --denoiser trans3`(复用已预存的 lat, 几乎不加算力)。**结果(30k/60, 1.24M 参数, loss 0.044 无 NaN)**: 原始无碰撞率 **0.083→0.15(近翻倍)**, 且 `raw_feasible` 1.0 / `gear_curv` 0.717 / 换档 2.77≈专家 **全部不退化** → **假设成立: 网络之前确实看不见, 喂回空间栅格就开始学躲**。但 0.15 远低于专家天花板 **0.917** → **软条件(仅看地图+MSE)不够**, 且再次暴露矛盾: 加 M18b 只终点投影后碰撞反跌回 0.083(投影穿碍够终点)。ckpt `parking/cache/diffusion_parking_trans3_spatial_n80.pt`。图 `figs/parking/m19_*.png`。
+
+### M19b — 测试时"终点+避障"联合投影 — **正向里程碑: 无碰撞率 0.083→~0.5, 不重训、构造可行仍 1.0**
+对症 M19 的两毛病(软条件不足 + 投影穿碍): 扩 `controlspace.refine_ctrl_to_goal` 加 `coll=` 参数, 目标从"只终点"改成 **终点 + 可微足迹-SDF 碰撞代价**(`penalty.footprint_collision`, 吃归一化位姿故加 `_world_to_norm` 适配)一起 Adam; 作用在**真实采样输出**(非 M18a 代理, 无 train/eval mismatch), κ 每步钳位 → **构造可行不破**。接入 `evaluate --refine-coll <w> --refine-margin <m>`(默认 0=关、退化为纯 M18b)。扫参得 **Pareto 前沿**(碰撞↑需牺牲端点)。**推荐均衡档**(w_coll=50, margin=0.2, iters=120, k=60): 无碰撞率 **0.083→~0.5**(DDPM 随机性下 0.47~0.50)、`raw_success`≈同值(可行恒 1.0)、端点 **0.13m**/航向 0.66°、`gear_curv` 0.7 仍超专家、换档 3.85(略增避让抖动)。偏碰撞档(margin 0.35/iters 300)可把碰撞推到 **0.63** 但端点松到 0.6m、gearCF 回落到专家水平。脚本 `parking/scripts/m19b_refine.sh`(不重训、~1min)。图 `figs/parking/m19b_*.png`。
+
+**M19+M19b 净结论**: 碰撞从长期卡死的 ~0.08 抬到 **~0.5**(成功率同步), 靠"空间条件(训时看见) + 联合投影(测试时避障)"双管齐下, 全程运动学可行 1.0、端点仍 <0.2m、不重训。剩余差距(0.5 vs 专家 0.917)属"软方法"上限——要再进一步须把碰撞**内化进训练**(ctrl 空间可微碰撞损失, 需重训)或更强投影/多假设采样。
+
+
 ## 4. 当前指标(12k 数据 / 30k 步重训,60 个 eval 场景,`--cond lat`)
 
 > ⚠ **本表是 Phase-1 MLP + 旧曲率度量(已被 M9 修正)的历史数字**。其中"运动学可行率/成功率"因度量伪artifact被系统性低估(连专家都 0%);最新有效度量与 conv 升级结果见 M9 表。

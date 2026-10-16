@@ -23,7 +23,7 @@ from .geometry import (denormalize_xy, cs_to_heading, cum_arclen,
                        curvature_from_poses, path_length, wrap, pose_error,
                        resample_poses)
 from .vehicle import Vehicle
-from .conditioner import MapConditioner, MapEncoderCNN
+from .conditioner import MapConditioner, MapEncoderCNN, SpatialMapConditioner
 from .diffusion import make_schedule, build_denoiser, sample
 from .map_vae import load_frozen_vae
 from .train import norm_traj4, pose3_to_norm4, CKPT, device
@@ -192,7 +192,11 @@ def load_model(ckpt=CKPT, cfg=None):
     dc = cfg.diffusion
     blob = torch.load(ckpt, map_location=device, weights_only=False)
     cond = blob.get("cond", "lat")
-    if cond == "lat":
+    if cond == "spatial":
+        vae = load_frozen_vae(lat_ch=dc.lat_ch)
+        enc = SpatialMapConditioner(vae, lat_hw=(9, 16), lat_ch=dc.lat_ch, out_ch=dc.map_emb,
+                                    use_sdf=blob.get("map_cond", "lat_sdf") != "vae").to(device)
+    elif cond == "lat":
         vae = load_frozen_vae(lat_ch=dc.lat_ch)
         use_sdf = blob.get("map_cond", "lat_sdf") == "lat_sdf"   # 旧 ckpt 无此字段 -> lat_sdf(向后兼容)
         enc = MapConditioner(vae, out_dim=dc.map_emb, lat_hw=(9, 16), use_sdf=use_sdf).to(device)
@@ -253,7 +257,7 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
     g4 = torch.tensor(pose3_to_norm4(gp[:k], bbox), device=device)
     sch = make_schedule(dc.t_steps, dc.b0, dc.b1, device)
     lat = None
-    if cond == "lat":
+    if cond in ("lat", "spatial"):
         from .train import precompute_latents
         lat = precompute_latents(enc.vae, maps_t)
     guide = None
@@ -283,11 +287,18 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         # M18b: 测试时终点投影(不重训, 仅拉采样终点到 goal; κ 钳位不破坏构造可行)。
         if refine and refine.get("iters", 0) > 0:
             from .controlspace import refine_ctrl_to_goal
+            coll = None
+            wc = float(refine.get("w_coll", 0.0))
+            if wc > 0:                                   # M19b: 投影叠加可微足迹-SDF 碰撞代价
+                foot = torch.tensor(Vehicle(cfg.vehicle).footprint_local,
+                                    dtype=torch.float32, device=device)
+                coll = dict(sdf_m=maps_t[:, 1:2] * SDF_CLIP, foot=foot,
+                            margin=float(refine.get("margin", 0.15)), w_coll=wc)
             ctrl_t = refine_ctrl_to_goal(ctrl_t, st_t, g4, bbox, kmax,
                                          getattr(model, "ctrl_u_scale", 1.0),
                                          iters=int(refine["iters"]), lr=float(refine.get("lr", 0.05)),
                                          w_pos=float(refine.get("w_pos", 1.0)),
-                                         w_ang=float(refine.get("w_ang", 0.3)))
+                                         w_ang=float(refine.get("w_ang", 0.3)), coll=coll)
             gen_n = ctrl_t.cpu().numpy()                                          # 后续指标基于投影后控制
         world4 = integrate_ctrl(ctrl_t, st_t, kmax,
                                  getattr(model, "ctrl_u_scale", 1.0)).cpu().numpy()  # (k,N,4) 世界
@@ -420,13 +431,16 @@ if __name__ == "__main__":
     ap.add_argument("--refine-lr", type=float, default=0.05, help="M18b: 投影 Adam 学习率")
     ap.add_argument("--refine-wpos", type=float, default=1.0, help="M18b: 终点位置权重")
     ap.add_argument("--refine-wang", type=float, default=0.3, help="M18b: 终点航向权重")
+    ap.add_argument("--refine-coll", type=float, default=0.0, help="M19b: 投影中足迹-SDF碰撞代价权重(0=关)")
+    ap.add_argument("--refine-margin", type=float, default=0.15, help="M19b: 碰撞安全间隙(m)")
     a = ap.parse_args()
     out = a.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "figs", "parking", "m6_eval_compare.png")
     gkw = dict(scale=a.g_scale, curv=a.g_curv, coll=a.g_coll, nh=a.g_nh,
                margin=a.g_margin, min_abar=a.g_min_abar)
     ckw = dict(path=a.critic, scale=a.c_scale, min_abar=a.c_min_abar)
-    refine = dict(iters=a.goal_refine, lr=a.refine_lr, w_pos=a.refine_wpos, w_ang=a.refine_wang)
+    refine = dict(iters=a.goal_refine, lr=a.refine_lr, w_pos=a.refine_wpos, w_ang=a.refine_wang,
+                  w_coll=a.refine_coll, margin=a.refine_margin)
     m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out, gkw=gkw, ckw=ckw, refine=refine)
     for kk, v in m.items():
         print("  %-22s %s" % (kk, round(v, 4) if isinstance(v, float) else v))
