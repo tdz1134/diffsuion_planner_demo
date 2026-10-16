@@ -59,21 +59,67 @@ def integrate_ctrl(ctrl, start3_w, kappa_max, u_scale):
     B, N, _ = ctrl.shape
     kap = torch.clamp(ctrl[..., 0], -1.0, 1.0) * kappa_max      # (B,N) 有符号曲率(钳位)
     u = ctrl[..., 1] * u_scale                                   # (B,N) 带符号弧长
-    x = torch.zeros(B, N, device=ctrl.device, dtype=ctrl.dtype)
-    y = torch.zeros_like(x)
-    th = torch.zeros_like(x)
-    x[:, 0] = start3_w[:, 0]; y[:, 0] = start3_w[:, 1]; th[:, 0] = start3_w[:, 2]
     eps = 1e-6
+    # 函数式累加(不就地写 x/y/th): 就地 slice 赋值会修改 autograd 保存过的视图, 使反向报 version 错。
+    x = start3_w[:, 0]; y = start3_w[:, 1]; th = start3_w[:, 2]
+    xs = [x]; ys = [y]; ths = [th]
     for i in range(1, N):
-        th0 = th[:, i - 1]; k = kap[:, i]; ui = u[:, i]
+        th0 = th; k = kap[:, i]; ui = u[:, i]
         thn = th0 + k * ui
         straight = (k.abs() < eps)
-        dx = torch.where(straight, ui * torch.cos(th0), (torch.sin(thn) - torch.sin(th0)) / torch.where(straight, torch.ones_like(k), k))
-        dy = torch.where(straight, ui * torch.sin(th0), (torch.cos(th0) - torch.cos(thn)) / torch.where(straight, torch.ones_like(k), k))
-        x[:, i] = x[:, i - 1] + dx
-        y[:, i] = y[:, i - 1] + dy
-        th[:, i] = thn
-    return torch.stack([x, y, torch.cos(th), torch.sin(th)], dim=-1)   # (B,N,4)
+        kk = torch.where(straight, torch.ones_like(k), k)
+        dx = torch.where(straight, ui * torch.cos(th0), (torch.sin(thn) - torch.sin(th0)) / kk)
+        dy = torch.where(straight, ui * torch.sin(th0), (torch.cos(th0) - torch.cos(thn)) / kk)
+        x = x + dx; y = y + dy; th = thn                     # 新张量, 无就地修改
+        xs.append(x); ys.append(y); ths.append(th)
+    X = torch.stack(xs, dim=1); Y = torch.stack(ys, dim=1); TH = torch.stack(ths, dim=1)
+    return torch.stack([X, Y, torch.cos(TH), torch.sin(TH)], dim=-1)   # (B,N,4)
+
+
+# --------------------------------------------------------------------------- #
+# M18: 终点→goal 可微到达惩罚(经 integrate_ctrl 回传, 不碰 κ=|dθ|/ds 病态)
+# --------------------------------------------------------------------------- #
+def goal_reach_pen(ctrl, start3_w, goal_n4, bbox, kappa_max, u_scale):
+    """ctrl:(B,N,2)归一化控制(通常是 x0_hat), start3_w:(B,3)世界起点,
+    goal_n4:(B,4)归一化目标[nx,ny,cos,sin], bbox=(x0,y0,x1,y1)。
+    将控制可微积分回世界位姿, 取终点与 goal 比较。返回 (pos_err(B,), ang_err(B,)):
+      pos_err = 归一化坐标差平方(x,y 各一), ang_err = 1-cos(dθ) ∈[0,2]。均为良态量。
+    """
+    poses = integrate_ctrl(ctrl, start3_w, kappa_max, u_scale)   # (B,N,4) 世界
+    end = poses[:, -1]                                            # (B,4) [x,y,cos,sin]
+    bx0, by0, bx1, by1 = bbox
+    nx = (end[:, 0] - bx0) / max(bx1 - bx0, 1e-9) * 2.0 - 1.0
+    ny = (end[:, 1] - by0) / max(by1 - by0, 1e-9) * 2.0 - 1.0
+    pos_err = (nx - goal_n4[:, 0]) ** 2 + (ny - goal_n4[:, 1]) ** 2
+    ang_err = 1.0 - (end[:, 2] * goal_n4[:, 2] + end[:, 3] * goal_n4[:, 3])
+    return pos_err, ang_err
+
+
+# --------------------------------------------------------------------------- #
+# M18b: 测试时终点投影——把已采样的控制序列用可微积分拉到终点=goal(不重训)
+# --------------------------------------------------------------------------- #
+def refine_ctrl_to_goal(ctrl, start3_w, goal_n4, bbox, kappa_max, u_scale,
+                        iters=80, lr=0.05, w_pos=1.0, w_ang=0.3):
+    """ctrl:(B,N,2)已采样归一化控制, start3_w:(B,3)世界起点, goal_n4:(B,4)归一化目标。
+    对控制序列做几步 Adam 梯度下降, 最小化终点位置+航向误差(goal_reach_pen)。
+    κ 通道每步钳到 [-1,1] -> **曲率/非完整构造保证不被破坏**(只优化终点)。
+    iters<=0 直接返回原 ctrl。返回优化后 ctrl(B,N,2)。
+    """
+    if iters is None or iters <= 0:
+        return ctrl
+
+    def _bounded(c):
+        return torch.cat([c[..., 0:1].clamp(-1.0, 1.0), c[..., 1:2]], dim=-1)
+
+    c = ctrl.detach().clone().requires_grad_(True)
+    opt = torch.optim.Adam([c], lr=lr)
+    for _ in range(iters):
+        pe, ae = goal_reach_pen(_bounded(c), start3_w, goal_n4, bbox, kappa_max, u_scale)
+        loss = (w_pos * pe + w_ang * ae).sum()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    return _bounded(c).detach()
 
 
 # --------------------------------------------------------------------------- #
@@ -107,3 +153,21 @@ if __name__ == "__main__":
               % (i, pe.max(), np.degrees(ae.max()), k.max(), kmax))
     print("\nSUMMARY: worst pos_err=%.3fm ang=%.1fdeg  max|kappa|=%.4f <= kappa_max=%.4f ? %s"
           % (worst_pe, np.degrees(worst_ae), worst_k, kmax, worst_k <= kmax * 1.02))
+
+    # ---- M18 goal_reach_pen 自检: 终点==goal 时惩罚应~0; 且梯度有限 ----
+    bbox = tuple(float(v) for v in dd["bbox"])
+    c0 = torch.tensor(encode_ctrl(traj[0], gear[0], kmax, u_scale)[None], requires_grad=True)  # (1,N,2)
+    st0 = torch.tensor(sp[0][None], dtype=torch.float32)                                       # (1,3)
+    ep = integrate_ctrl(c0, st0, kmax, u_scale)[:, -1]                                        # (1,4) 世界终点
+    bx0, by0, bx1, by1 = bbox
+    gnx = (ep[:, 0] - bx0) / (bx1 - bx0) * 2.0 - 1.0
+    gny = (ep[:, 1] - by0) / (by1 - by0) * 2.0 - 1.0
+    goal_n4 = torch.stack([gnx, gny, ep[:, 2], ep[:, 3]], dim=1).detach()                       # 把真实终点当 goal
+    pe0, ae0 = goal_reach_pen(c0, st0, goal_n4, bbox, kmax, u_scale)
+    (pe0 + ae0).sum().backward()
+    gfin = bool(torch.isfinite(c0.grad).all())
+    # 扰动控制(把曲率通道整体推满) -> 惩罚应明显 > 0
+    c1 = c0.detach().clone(); c1[:, :, 0] = 0.9
+    pe1, ae1 = goal_reach_pen(c1, st0, goal_n4, bbox, kmax, u_scale)
+    print("[M18 goal_reach] self-goal pos_err=%.3e ang_err=%.3e grad_finite=%s | perturbed pos_err=%.3f ang=%.3f"
+          % (pe0.mean().item(), ae0.mean().item(), gfin, pe1.mean().item(), ae1.mean().item()))

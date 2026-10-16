@@ -224,7 +224,7 @@ def load_critic(path):
     return crit
 
 
-def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw=None, ckw=None):
+def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw=None, ckw=None, refine=None):
     cfg = default_config()
     dc = cfg.diffusion
     veh = Vehicle(cfg.vehicle)
@@ -280,6 +280,15 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         kmax = 1.0 / veh.cfg.r_min
         ctrl_t = torch.tensor(gen_n, dtype=torch.float32, device=device)          # (k,N,2)
         st_t = torch.tensor(sp[:k], dtype=torch.float32, device=device)           # (k,3) 世界起点
+        # M18b: 测试时终点投影(不重训, 仅拉采样终点到 goal; κ 钳位不破坏构造可行)。
+        if refine and refine.get("iters", 0) > 0:
+            from .controlspace import refine_ctrl_to_goal
+            ctrl_t = refine_ctrl_to_goal(ctrl_t, st_t, g4, bbox, kmax,
+                                         getattr(model, "ctrl_u_scale", 1.0),
+                                         iters=int(refine["iters"]), lr=float(refine.get("lr", 0.05)),
+                                         w_pos=float(refine.get("w_pos", 1.0)),
+                                         w_ang=float(refine.get("w_ang", 0.3)))
+            gen_n = ctrl_t.cpu().numpy()                                          # 后续指标基于投影后控制
         world4 = integrate_ctrl(ctrl_t, st_t, kmax,
                                  getattr(model, "ctrl_u_scale", 1.0)).cpu().numpy()  # (k,N,4) 世界
         pgear_all = np.sign(gen_n[:, :, 1])                                        # (k,N) ±1(由带符号弧长推档位)
@@ -347,6 +356,7 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         rep_seg_kappa=float(np.mean(r_maxks)), rep_gear_switches=float(np.mean(r_nsegs)),
         slip_tol=SLIP_TOL,
         kappa_limit=1.0 / veh.cfg.r_min,
+        goal_refine=int(refine.get("iters", 0)) if refine else 0,
         gear_curv_feasible=(n_gcurv_ok / k if gaccs else None),
         expert_gear_curv_feasible=(n_expgcurv_ok / k if gaccs else None),
         gear_acc=(float(np.mean(gaccs)) if gaccs else None),
@@ -406,13 +416,18 @@ if __name__ == "__main__":
     ap.add_argument("--critic", type=str, default=None, help="可行性判别器 ckpt(classifier guidance)")
     ap.add_argument("--c-scale", type=float, default=0.0, help="判别器引导步长(0=关)")
     ap.add_argument("--c-min-abar", type=float, default=0.9, help="仅在 abar>=此值(晚步)时进判别器引导")
+    ap.add_argument("--goal-refine", type=int, default=0, help="M18b ctrl: 测试时终点投影迭代数(0=关)")
+    ap.add_argument("--refine-lr", type=float, default=0.05, help="M18b: 投影 Adam 学习率")
+    ap.add_argument("--refine-wpos", type=float, default=1.0, help="M18b: 终点位置权重")
+    ap.add_argument("--refine-wang", type=float, default=0.3, help="M18b: 终点航向权重")
     a = ap.parse_args()
     out = a.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "figs", "parking", "m6_eval_compare.png")
     gkw = dict(scale=a.g_scale, curv=a.g_curv, coll=a.g_coll, nh=a.g_nh,
                margin=a.g_margin, min_abar=a.g_min_abar)
     ckw = dict(path=a.critic, scale=a.c_scale, min_abar=a.c_min_abar)
-    m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out, gkw=gkw, ckw=ckw)
+    refine = dict(iters=a.goal_refine, lr=a.refine_lr, w_pos=a.refine_wpos, w_ang=a.refine_wang)
+    m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out, gkw=gkw, ckw=ckw, refine=refine)
     for kk, v in m.items():
         print("  %-22s %s" % (kk, round(v, 4) if isinstance(v, float) else v))
     print("[saved] %s" % out)

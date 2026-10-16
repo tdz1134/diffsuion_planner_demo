@@ -141,6 +141,10 @@ class DiffusionConfig:
     # Phase 5 (M16): x0-空间可行性损失(施加在 x0_hat、仅晚步高 abar 时), 默认 0=关(避开 M8 发散)
     w_smooth: float = 0.0        # 一/二阶时序差分平滑(治航点抖动)
     w_curv_x0: float = 0.0       # 速度自适应曲率惩罚 κ_max(v)=min(κ_geo, a_lat/v²)
+    # Phase 5 (M18): 控制空间(representation=ctrl)的终点→goal 可微到达惩罚(经 integrate_ctrl 回传, 不碰 κ=|dθ|/ds 病态)。
+    #   默认 0=关。作用于 x0_hat(预测干净控制)积分出的终点, 按 abar 门控(高噪步抑制)。修 ctrl “端点不钉→终点误差”问题。
+    w_goal_pos: float = 0.0      # 终点位置到达惩罚权重(归一化坐标差平方)
+    w_goal_ang: float = 0.0      # 终点航向到达惩罚权重(1-cos(dθ))
     # 地图条件构成(仅 cond=lat 时有意义): lat_sdf=VAE latent⊕SDF双分支(默认, 向后兼容); vae=只用冻结VAE latent(去掉SDF分支)
     map_cond: str = "lat_sdf"
     dconv_hidden: int = 128      # conv 去噪器主干通道数

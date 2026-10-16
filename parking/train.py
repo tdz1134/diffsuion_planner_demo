@@ -23,6 +23,7 @@ from .map_vae import load_frozen_vae
 from .conditioner import MapConditioner, MapEncoderCNN
 from .diffusion import make_schedule, q_sample, build_denoiser, sample, pred_x0
 from .penalty import traj_penalty_terms, smooth_pen
+from .controlspace import goal_reach_pen
 from .vehicle import Vehicle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,7 +64,7 @@ def precompute_latents(vae, maps, batch=2048):
 # --------------------------------------------------------------------------- #
 # 训练
 # --------------------------------------------------------------------------- #
-def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=None):
+def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=None, ctrl_pen=None):
     params = [p for p in list(model.parameters()) + list(enc.parameters()) if p.requires_grad]
     lr = cfg.lr * (batch / cfg.batch) ** 0.5
     opt = torch.optim.Adam(params, lr=lr)
@@ -102,6 +103,13 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
             loss = loss + aux
             postfix.update(curv=f"{tp['curv'].mean().item():.3f}",
                            coll=f"{tp['coll'].mean().item():.3f}")
+        if ctrl_pen is not None:                     # M18: ctrl 空间终点→goal 可微到达惩罚(经 integrate_ctrl, 不碰曲率病态)
+            x0h = pred.float() if use_x0 else pred_x0(xt.float(), pred.float(), sch, t)  # (B,N,2) 归一化控制估计
+            pe, ae = goal_reach_pen(x0h, ctrl_pen["st_w"][idx], g, ctrl_pen["bbox"],
+                                    ctrl_pen["kmax"], ctrl_pen["u_scale"])                # g=g4[idx] 归一化目标
+            gate = sch["abar"][t]
+            loss = loss + ctrl_pen["w_pos"] * (gate * pe).mean() + ctrl_pen["w_ang"] * (gate * ae).mean()
+            postfix.update(gpos=f"{pe.mean().item():.3f}", gang=f"{ae.mean().item():.3f}")
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt); scaler.update()
@@ -115,7 +123,7 @@ def train(model, enc, x0, maps, s4, g4, sch, cfg, steps, batch, lat=None, pen=No
 def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKPT,
          w_nh=None, w_curv=None, w_coll=None, coll_margin=None, denoiser=None, n_wp=None,
          map_cond=None, use_gear=None, pred_mode=None, w_curv_x0=None, w_smooth=None,
-         representation=None, u_scale=None):
+         representation=None, u_scale=None, w_goal_pos=None, w_goal_ang=None):
     cfg = default_config()
     dc = cfg.diffusion
     if denoiser is not None:
@@ -134,6 +142,10 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
         dc.w_curv_x0 = w_curv_x0
     if w_smooth is not None:
         dc.w_smooth = w_smooth
+    if w_goal_pos is not None:
+        dc.w_goal_pos = w_goal_pos
+    if w_goal_ang is not None:
+        dc.w_goal_ang = w_goal_ang
     if w_nh is not None:
         dc.w_nh = w_nh
     if w_curv is not None:
@@ -211,8 +223,17 @@ def main(npz_path=None, steps=None, batch=None, cond="lat", quick=False, out=CKP
         print("[warn] representation=ctrl: pose-空间几何惩罚不适用(可行性由构造保证), 已忽略 --w-*; 仅用 MSE(ctrl) 训练")
         pen = None
 
+    # M18: ctrl 专属——终点→goal 可微到达惩罚(经 integrate_ctrl 回传、不碰曲率病态), 只靠 start/goal/bbox。
+    ctrl_pen = None
+    if getattr(dc, "representation", "pose") == "ctrl" and (dc.w_goal_pos or dc.w_goal_ang):
+        st_w = torch.tensor(d["start_pose"][tr_mask], dtype=torch.float32, device=device)   # (M,3) 世界起点(与 x0 同序)
+        ctrl_pen = dict(st_w=st_w, bbox=bbox, kmax=1.0 / cfg.vehicle.r_min,
+                        u_scale=float(dc.ctrl_u_scale), w_pos=float(dc.w_goal_pos), w_ang=float(dc.w_goal_ang))
+        print("[ctrl_pen] M18 终点到达惩罚 w_pos=%g w_ang=%g (经 integrate_ctrl 可微, abar 门控)"
+              % (ctrl_pen["w_pos"], ctrl_pen["w_ang"]))
+
     sch = make_schedule(dc.t_steps, dc.b0, dc.b1, device)
-    train(model, enc, x0, maps, s4, g4, sch, dc, steps=steps, batch=batch, lat=lat, pen=pen)
+    train(model, enc, x0, maps, s4, g4, sch, dc, steps=steps, batch=batch, lat=lat, pen=pen, ctrl_pen=ctrl_pen)
 
     os.makedirs(os.path.dirname(out), exist_ok=True)
     torch.save({"model": model.state_dict(), "enc": enc.state_dict(),
@@ -266,6 +287,8 @@ if __name__ == "__main__":
                     help="M16: 去噪预测目标 eps(默认)/x0(轨迹中心, 配 x0 可行性损失)")
     ap.add_argument("--w-curv-x0", type=float, default=None, help="M16 x0-空间曲率惩罚权重(0=关)")
     ap.add_argument("--w-smooth", type=float, default=None, help="M16 一/二阶时序差平滑惩罚权重(0=关)")
+    ap.add_argument("--w-goal-pos", type=float, default=None, help="M18 ctrl: 终点位置到达惩罚权重(0=关)")
+    ap.add_argument("--w-goal-ang", type=float, default=None, help="M18 ctrl: 终点航向到达惩罚权重(0=关)")
     ap.add_argument("--n-wp", type=int, default=None,
                     help="定长航点数 N; 缺省自动从数据 traj 推导(向后兼容)")
     a = ap.parse_args()
@@ -273,4 +296,5 @@ if __name__ == "__main__":
          w_nh=a.w_nh, w_curv=a.w_curv, w_coll=a.w_coll, coll_margin=a.coll_margin,
          denoiser=a.denoiser, n_wp=a.n_wp, map_cond=a.map_cond, use_gear=a.use_gear or None,
          pred_mode=a.pred_mode, w_curv_x0=a.w_curv_x0, w_smooth=a.w_smooth,
-         representation=a.representation, u_scale=a.u_scale)
+         representation=a.representation, u_scale=a.u_scale,
+         w_goal_pos=a.w_goal_pos, w_goal_ang=a.w_goal_ang)
