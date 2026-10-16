@@ -11,6 +11,10 @@ __pycache__/
 
 # 日志 / 临时
 *.log
+matplotlib-*/
+
+# 顶层数据/结果缓存(npz 可重生; 结果 txt 可重跑; 与已跟踪的 parking/cache/*.pt 无关)
+/cache/
 
 # 系统文件
 .DS_Store

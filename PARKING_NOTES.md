@@ -13,6 +13,41 @@
 训一个**条件扩散模型**,以后给它一张车位图 + 起点 + 终点,它直接"画"出一条泊车轨迹。
 全程**模块化 / 算法接口分离**:HA\*、场景生成、后处理、地图编码、扩散模型都是可替换的插件。
 
+---
+
+## 0.5 最终结果总账（M17–M20、本次收口）
+
+**目标**: 让条件扩散规划器端到端产出「运动学可行 + 到得准 + 不撞」的泊车轨迹。
+
+**爬升路线（一个洞察接一个）**:
+- **M17 控制空间扩散** → 非完整/曲率可行**由构造保证**（`raw_feasible=1.0`）。
+- **M18b 测试时终点投影** → 端点 1.74m→**2.5cm**，不重训、κ 钳位不破构造。
+- **M19 空间地图条件（trans3 + SpatialMapConditioner）** → 不拍平冻结 VAE latent、拆成 144 空间 token 让航点 cross-attn → 网络"看见"障碍（碰撞 0.083→0.15）。
+- **M19b 联合投影** → 把可微足迹-SDF 碰撞代价并入测试时投影，终点+避障一起优化（碰撞→~0.5）。
+- **M20 Best-of-N** → 每场景采 N 条投影后择优（碰撞→~0.8）。
+
+**最终指标（k=60 场景、无引导、best_of=16）**:
+
+| 维度 | 模型 | 参照 |
+|---|---|---|
+| 运动学可行 `raw_feasible` | **1.0**（构造） | 专家 1.0 |
+| 分档曲率可行 `gear_curv_feasible` | ~0.55–0.6 | 专家 0.5（模型反超） |
+| 端点误差 `mean_end_pos_err` | **~0.05 m** / ~0.1° | — |
+| 无碰撞率 `raw_collision_free` | **~0.80**（N=8 ~0.75） | 专家天花板 **0.917** |
+| 成功率（无碰撞且可行） | **~0.80** | 专家 0.917 |
+
+**复现（三条命令，依次）**:
+```bash
+bash parking/scripts/m19_run.sh                 # 训 ctrl+trans3+spatial (~47min) -> diffusion_parking_trans3_spatial_n80.pt
+bash parking/scripts/m19b_refine.sh             # M19b 联合投影对比(不重训, ~1min)
+SWEEP=1 bash parking/scripts/m20_bestof.sh      # M20 Best-of-N 扫 N=1/8/16(不重训)
+```
+单次评估例: `python -m parking.evaluate --ckpt parking/cache/diffusion_parking_trans3_spatial_n80.pt --k 60 --goal-refine 120 --refine-coll 50 --refine-margin 0.2 --best-of 16`。
+
+**诚实边界 / 负结果**: ① Best-of-N 是**推断算力换质量**(×N)，非模型本身变强，报指标需标 N；② 0.8 vs 专家 0.917 的差距属"软方法"上限，再往上需把碰撞**内化进训练**（未试、高风险）；③ 历史上"往训练/引导塞几何惩罚"均发散或负（M8/M12/M16/**M18a**）——M18a 训时终点惩罚反而把端点从 1.74m 恶化到 2.47m（train/eval mismatch），教训已入长期记忆。结构框图见 `figs/parking/architecture.png`（生成脚本 `parking/scripts/make_arch_diagram.py`）。
+
+---
+
 ## 1. 目录(每个文件干什么)
 
 | 文件 | 干什么(通俗) |
