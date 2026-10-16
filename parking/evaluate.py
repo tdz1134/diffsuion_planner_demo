@@ -228,7 +228,7 @@ def load_critic(path):
     return crit
 
 
-def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw=None, ckw=None, refine=None):
+def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw=None, ckw=None, refine=None, best_of=1):
     cfg = default_config()
     dc = cfg.diffusion
     veh = Vehicle(cfg.vehicle)
@@ -272,36 +272,69 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
     if ckw and ckw.get("scale", 0) > 0 and ckw.get("path"):
         critic = load_critic(ckw["path"]); c_scale = float(ckw["scale"])
         c_minabar = float(ckw.get("min_abar", 0.9))
-    gen_n = sample(model, enc, maps_t, s4, g4, sch, z=lat, guide=guide,
-                   critic=critic, critic_scale=c_scale, critic_min_abar=c_minabar).cpu().numpy()   # pose:(k,N,4/5) norm | ctrl:(k,N,2)
+    best_of = max(1, int(best_of or 1))
+    u_scale = float(getattr(model, "ctrl_u_scale", 1.0))
+    gen_dev = sample(model, enc, maps_t, s4, g4, sch, z=lat, guide=guide,
+                     critic=critic, critic_scale=c_scale, critic_min_abar=c_minabar)   # (k,N,dim) device
+    gen_n = gen_dev.cpu().numpy()                                                       # pose:(k,N,4/5) norm | ctrl:(k,N,2)
 
     # M17: ctrl 表示——将归一化控制 (k,N,2) 可微积分回世界位姿 (k,N,4)(曲率/非完整由构造保证)。
     #   预测档位由带符号弧长 u 的符号得到; 端点不钉(靠条件+事后 repair), 故终点误差可能非 0。
     is_ctrl = getattr(model, "representation", "pose") == "ctrl"
     world4 = pgear_all = None
     if is_ctrl:
-        from .controlspace import integrate_ctrl
+        from .controlspace import (integrate_ctrl, refine_ctrl_to_goal, goal_reach_pen, _world_to_norm)
+        from .penalty import footprint_collision
         kmax = 1.0 / veh.cfg.r_min
-        ctrl_t = torch.tensor(gen_n, dtype=torch.float32, device=device)          # (k,N,2)
         st_t = torch.tensor(sp[:k], dtype=torch.float32, device=device)           # (k,3) 世界起点
-        # M18b: 测试时终点投影(不重训, 仅拉采样终点到 goal; κ 钳位不破坏构造可行)。
-        if refine and refine.get("iters", 0) > 0:
-            from .controlspace import refine_ctrl_to_goal
-            coll = None
-            wc = float(refine.get("w_coll", 0.0))
-            if wc > 0:                                   # M19b: 投影叠加可微足迹-SDF 碰撞代价
-                foot = torch.tensor(Vehicle(cfg.vehicle).footprint_local,
-                                    dtype=torch.float32, device=device)
-                coll = dict(sdf_m=maps_t[:, 1:2] * SDF_CLIP, foot=foot,
-                            margin=float(refine.get("margin", 0.15)), w_coll=wc)
-            ctrl_t = refine_ctrl_to_goal(ctrl_t, st_t, g4, bbox, kmax,
-                                         getattr(model, "ctrl_u_scale", 1.0),
-                                         iters=int(refine["iters"]), lr=float(refine.get("lr", 0.05)),
-                                         w_pos=float(refine.get("w_pos", 1.0)),
-                                         w_ang=float(refine.get("w_ang", 0.3)), coll=coll)
-            gen_n = ctrl_t.cpu().numpy()                                          # 后续指标基于投影后控制
-        world4 = integrate_ctrl(ctrl_t, st_t, kmax,
-                                 getattr(model, "ctrl_u_scale", 1.0)).cpu().numpy()  # (k,N,4) 世界
+        do_refine = bool(refine) and int(refine.get("iters", 0)) > 0
+        coll = None
+        wc = float(refine.get("w_coll", 0.0)) if refine else 0.0
+        if wc > 0:                                       # M19b: 可微足迹-SDF 碰撞代价(投影与择优共用)
+            foot = torch.tensor(Vehicle(cfg.vehicle).footprint_local,
+                                dtype=torch.float32, device=device)
+            coll = dict(sdf_m=maps_t[:, 1:2] * SDF_CLIP, foot=foot,
+                        margin=float(refine.get("margin", 0.15)), w_coll=wc)
+
+        def _project(ctrl):
+            """一条 ctrl -> (投影后 ctrl, 世界位姿)。M18b/M19b: 终点(+碰撞)联合投影, κ 每步钳位。"""
+            if do_refine:
+                ctrl = refine_ctrl_to_goal(ctrl, st_t, g4, bbox, kmax, u_scale,
+                                           iters=int(refine["iters"]), lr=float(refine.get("lr", 0.05)),
+                                           w_pos=float(refine.get("w_pos", 1.0)),
+                                           w_ang=float(refine.get("w_ang", 0.3)), coll=coll)
+            return ctrl, integrate_ctrl(ctrl, st_t, kmax, u_scale)                 # (k,N,2), (k,N,4) 世界
+
+        def _score(ctrl, poses):
+            """择优代价 = 投影目标本身(终点归一化位置²+航向 + w_coll·碰撞), 越小越好。"""
+            pe, ae = goal_reach_pen(ctrl, st_t, g4, bbox, kmax, u_scale)
+            s = float(refine.get("w_pos", 1.0)) * pe + float(refine.get("w_ang", 0.3)) * ae
+            if coll is not None:
+                s = s + wc * footprint_collision(_world_to_norm(poses, bbox), coll["sdf_m"],
+                                                 bbox, coll["foot"], coll["margin"])
+            return s
+
+        if best_of > 1:
+            # M20: 采 best_of 条(不同噪声 DDPM 样本), 各自投影, 逐场景取代价最小的一条。
+            ctrl_b = poses_b = score_b = None
+            for j in range(best_of):
+                cj = gen_dev if j == 0 else sample(model, enc, maps_t, s4, g4, sch, z=lat,
+                                                   guide=guide, critic=critic,
+                                                   critic_scale=c_scale, critic_min_abar=c_minabar)
+                cj, pj = _project(cj)
+                sj = _score(cj, pj)
+                if score_b is None:
+                    ctrl_b, poses_b, score_b = cj, pj, sj
+                else:
+                    better = sj < score_b
+                    ctrl_b = torch.where(better[:, None, None], cj, ctrl_b)
+                    poses_b = torch.where(better[:, None, None], pj, poses_b)
+                    score_b = torch.where(better, sj, score_b)
+            world4 = poses_b.cpu().numpy(); gen_n = ctrl_b.cpu().numpy()
+        else:
+            ctrl_t = torch.tensor(gen_n, dtype=torch.float32, device=device)
+            ctrl_t, poses = _project(ctrl_t)
+            world4 = poses.cpu().numpy(); gen_n = ctrl_t.cpu().numpy()
         pgear_all = np.sign(gen_n[:, :, 1])                                        # (k,N) ±1(由带符号弧长推档位)
 
     res = cfg.lot.res
@@ -368,6 +401,7 @@ def evaluate(ckpt=CKPT, npz_path=None, k=None, n_viz=None, render_path=None, gkw
         slip_tol=SLIP_TOL,
         kappa_limit=1.0 / veh.cfg.r_min,
         goal_refine=int(refine.get("iters", 0)) if refine else 0,
+        best_of=int(best_of),
         gear_curv_feasible=(n_gcurv_ok / k if gaccs else None),
         expert_gear_curv_feasible=(n_expgcurv_ok / k if gaccs else None),
         gear_acc=(float(np.mean(gaccs)) if gaccs else None),
@@ -433,6 +467,7 @@ if __name__ == "__main__":
     ap.add_argument("--refine-wang", type=float, default=0.3, help="M18b: 终点航向权重")
     ap.add_argument("--refine-coll", type=float, default=0.0, help="M19b: 投影中足迹-SDF碰撞代价权重(0=关)")
     ap.add_argument("--refine-margin", type=float, default=0.15, help="M19b: 碰撞安全间隙(m)")
+    ap.add_argument("--best-of", type=int, default=1, help="M20 ctrl: 测试时采 N 条投影后择优(1=关)")
     a = ap.parse_args()
     out = a.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "figs", "parking", "m6_eval_compare.png")
@@ -441,7 +476,8 @@ if __name__ == "__main__":
     ckw = dict(path=a.critic, scale=a.c_scale, min_abar=a.c_min_abar)
     refine = dict(iters=a.goal_refine, lr=a.refine_lr, w_pos=a.refine_wpos, w_ang=a.refine_wang,
                   w_coll=a.refine_coll, margin=a.refine_margin)
-    m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out, gkw=gkw, ckw=ckw, refine=refine)
+    m, _ = evaluate(a.ckpt, a.npz, a.k, a.viz, render_path=out, gkw=gkw, ckw=ckw, refine=refine,
+                    best_of=a.best_of)
     for kk, v in m.items():
         print("  %-22s %s" % (kk, round(v, 4) if isinstance(v, float) else v))
     print("[saved] %s" % out)
